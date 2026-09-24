@@ -37,9 +37,11 @@
    built-in glyphs and Japanese still works. */
 bool ui_init(Budget *budget, const char *font_path);
 
-/* The surface the functions below draw on (default: the landscape back
-   buffer, KOMI_SCREEN_* at KOMI_VRAM_STRIDE). */
-void ui_set_surface(int width, int height, int stride);
+/* The surface the functions below draw on: pixel (x, y) of a width x
+   height box is vram[origin + x * step_x + y * step_y] (default: the
+   landscape back buffer, KOMI_SCREEN_* at KOMI_VRAM_STRIDE). */
+void ui_set_surface(int width, int height, long step_x, long step_y,
+                    long origin);
 
 void ui_fill(uint16_t *vram, int x, int y, int width, int height,
              uint16_t color);

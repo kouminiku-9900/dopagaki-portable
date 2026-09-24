@@ -1059,6 +1059,15 @@ bool media_psp_backend_wide_program_rejected(void);
  * PspMediaWideProgram from src/media_backend_psp_policy.h.
  */
 void media_psp_backend_set_wide_program(const char *name);
+/* Process totals of AAC blocks sent to the DAC, and of audio worker wake-ups
+   that found the queue empty (heard as crackle or gaps). */
+void media_psp_backend_audio_output_counters(uint32_t *blocks,
+                                             uint32_t *starves);
+/* Output calls that began more than one block after the previous call
+   returned (the DAC ran dry), their summed excess, and the largest since the
+   last call (reset by reading). */
+void media_psp_backend_audio_gap_counters(uint32_t *gaps, uint32_t *gap_us,
+                                          uint32_t *max_us);
 int media_psp_backend_wide_program(void);
 /*
  * Where in the frame the browser's next advance runs, as a PspMediaAdvanceMode

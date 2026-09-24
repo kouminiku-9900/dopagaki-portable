@@ -196,9 +196,8 @@ static void screenshot(const uint16_t *canvas, const char *name)
     fwrite(header, 1, sizeof header, file);
     static unsigned char line[W * 3];
     for (int y = H - 1; y >= 0; y--) {
-        const uint16_t *source = canvas + (size_t) y * KOMI_PORTRAIT_STRIDE;
         for (int x = 0; x < W; x++) {
-            uint16_t p = source[x];
+            uint16_t p = komi_canvas_read(canvas, x, y);
             line[x * 3 + 0] = (unsigned char) (((p >> 11) & 31u) << 3);
             line[x * 3 + 1] = (unsigned char) (((p >> 5) & 63u) << 2);
             line[x * 3 + 2] = (unsigned char) ((p & 31u) << 3);
@@ -499,6 +498,7 @@ static PlayExit play_current(const AutoPlay *automatic)
     bool shot_taken = false, auto_liked = false;
     PlayExit exit = PLAY_NEXT;
     const char *outcome = "moved";
+    komi_playback_audio_mark(&playback);
     bool accepted = psp_media_open_provider_route(&komi.media, url,
                                                   ++app.generation);
     if (!accepted) {
@@ -577,7 +577,12 @@ static PlayExit play_current(const AutoPlay *automatic)
                 /* Draw the overlay over the current picture; the canvas
                    then holds exactly what was shown. */
                 komi_playback_frame(&playback, player_overlay, &view, true);
-                screenshot(komi_canvas(), automatic->shot);
+                /* Drawing straight into the back buffer means the frame
+                   just shown is now the front one. */
+                screenshot(komi_orientation() == KOMI_PORTRAIT_DIRECT
+                               ? psp_display_front_buffer(&komi.display)
+                               : komi_canvas(),
+                           automatic->shot);
                 shot_taken = true;
             }
             if (now - playing_since > automatic->play_us) {
@@ -586,14 +591,48 @@ static PlayExit play_current(const AutoPlay *automatic)
             }
         }
     }
-    komi_result("play end id=%s outcome=%s position=%llums frames=%u "
-                "draw-mean=%lluus heap-used=%u",
-                item->id, outcome,
+    char stages[260];
+    komi_playback_stages(&playback, stages, sizeof stages);
+    unsigned audio_blocks = 0, audio_starves = 0;
+    komi_playback_audio(&playback, &audio_blocks, &audio_starves);
+    MediaBackendStats stats = {0};
+    if (psp_media_backend_stats_snapshot(&komi.media, &stats))
+        komi_result("stats id=%s format=%dx%d itag=%d/%d decoded=%u "
+                    "dropped=%u audio-dropped=%llu stream-audio-blocks=%u",
+                    item->id, komi.media.stream.width,
+                    komi.media.stream.height, komi.media.stream.itag,
+                    komi.media.stream.audio_itag,
+                    (unsigned) stats.decoded_video_frames,
+                    (unsigned) stats.dropped_video_frames,
+                    (unsigned long long) stats.dropped_audio_samples,
+                    (unsigned) stats.audio_output_blocks);
+    char audio[260];
+    komi_playback_audio_text(&playback, audio, sizeof audio);
+    unsigned ticks = 0, tick_submits = 0;
+    komi_feed_tick_counts(&ticks, &tick_submits);
+    size_t audio_length = strlen(audio);
+    unsigned ge_draws = 0;
+    uint64_t ge_wait = 0, ge_wait_max = 0;
+    komi_portrait_ge_counts(&ge_draws, &ge_wait, &ge_wait_max);
+    uint64_t ge_stage = 0, ge_stage_max = 0;
+    komi_portrait_ge_stage_counts(&ge_stage, &ge_stage_max);
+    snprintf(audio + audio_length, sizeof audio - audio_length,
+             " feed-ticks=%u/%u ge=%u/%llu/%lluus stage=%llu/%lluus",
+             tick_submits, ticks, ge_draws,
+             (unsigned long long) (ge_draws == 0 ? 0 : ge_wait / ge_draws),
+             (unsigned long long) ge_wait_max,
+             (unsigned long long) (ge_draws == 0 ? 0 : ge_stage / ge_draws),
+             (unsigned long long) ge_stage_max);
+    (void) audio_blocks;
+    (void) audio_starves;
+    komi_result("play end id=%s outcome=%s %s position=%llums frames=%u "
+                "draws=%u draw-mean=%lluus %s heap-used=%u",
+                item->id, outcome, audio,
                 (unsigned long long) (komi.media.ui.current_time_us / 1000u),
-                playback.presented,
+                playback.presented, playback.draws,
                 (unsigned long long) (playback.draws == 0 ? 0
                                       : playback.draw_us / playback.draws),
-                komi_heap_used());
+                stages, komi_heap_used());
     komi_playback_close(&playback);
     app.buttons = ~0u; /* ignore whatever is still held */
     return exit;
@@ -921,6 +960,16 @@ typedef struct {
     bool autotest;
     char query[128];
     unsigned play_seconds;
+    /* draw=canvas: the first version's canvas-and-rotate path (for
+       comparison); the default draws through the rotation directly. */
+    bool draw_canvas;
+    /* draw=cpu: rotate the video with the CPU instead of the GE. */
+    bool draw_cpu;
+    /* feed_ticks=0: feed the codec once per frame only (for comparison). */
+    bool no_feed_ticks;
+    /* autotest_shots=0: no screenshots during playback (writing one over
+       host0: stalls the frame loop ~200 ms, which skews the audio gaps). */
+    bool no_shots;
 } Config;
 
 static void load_config(Config *config)
@@ -942,6 +991,14 @@ static void load_config(Config *config)
         else if (sscanf(line, "autotest_play_seconds=%u", &value) == 1
                  && value > 0)
             config->play_seconds = value;
+        else if (strcmp(line, "draw=canvas") == 0)
+            config->draw_canvas = true;
+        else if (strcmp(line, "draw=cpu") == 0)
+            config->draw_cpu = true;
+        else if (strcmp(line, "feed_ticks=0") == 0)
+            config->no_feed_ticks = true;
+        else if (strcmp(line, "autotest_shots=0") == 0)
+            config->no_shots = true;
     }
     fclose(file);
 }
@@ -971,7 +1028,8 @@ static void autotest(const Config *config)
         "shot-02-feed1.bmp", "shot-03-feed2.bmp", "shot-04-feed3.bmp"};
     unsigned played = 0;
     for (int i = 0; i < 3 && feed.count > 0; i++) {
-        AutoPlay play = {true, play_us, false, shots[i]};
+        AutoPlay play = {true, play_us, false,
+                         config->no_shots ? NULL : shots[i]};
         if (play_current_retrying(&play) != PLAY_FAILED) played++;
         if (!feed_advance()) break;
     }
@@ -985,7 +1043,8 @@ static void autotest(const Config *config)
                        "search finds Shorts");
     ShortItem first = feed.items[0];
     size_t before = mylist.count;
-    AutoPlay play = {true, play_us, true, "shot-05-search.bmp"};
+    AutoPlay play = {true, play_us, true,
+                     config->no_shots ? NULL : "shot-05-search.bmp"};
     failures += !check(play_current_retrying(&play) != PLAY_FAILED,
                        "searched Short plays");
     failures += !check(mylist_find(&mylist, first.id) == 0
@@ -1022,8 +1081,16 @@ int main(int argc, char **argv)
     Config config;
     load_config(&config);
     komi_platform_init(false);
-    komi_set_portrait(true);
-    ui_set_surface(W, H, KOMI_PORTRAIT_STRIDE);
+    komi_set_orientation(config.draw_canvas ? KOMI_PORTRAIT_CANVAS
+                                            : KOMI_PORTRAIT_DIRECT);
+    long step_x, step_y, origin;
+    komi_canvas_steps(&step_x, &step_y, &origin);
+    ui_set_surface(W, H, step_x, step_y, origin);
+    komi_set_feed_ticks(!config.no_feed_ticks);
+    komi_set_portrait_ge(!config.draw_cpu);
+    komi_result("draw %s feed-ticks=%d", config.draw_canvas ? "canvas"
+                                         : config.draw_cpu ? "cpu" : "ge",
+                !config.no_feed_ticks);
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     read_button_setting();

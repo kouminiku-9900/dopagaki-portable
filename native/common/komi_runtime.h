@@ -81,28 +81,97 @@ typedef void (*KomiOverlay)(uint16_t *vram, void *context);
 #define KOMI_PORTRAIT_HEIGHT KOMI_SCREEN_WIDTH
 #define KOMI_PORTRAIT_STRIDE KOMI_PORTRAIT_WIDTH
 
-/* Switch presentation to the portrait canvas (before drawing anything). */
-void komi_set_portrait(bool portrait);
-/* The surface programs draw on: the portrait canvas, or the back buffer in
-   landscape. NULL when there is no back buffer. */
+typedef enum {
+    KOMI_LANDSCAPE,
+    /* Draw on a 272x480 canvas in RAM and rotate all of it into the back
+       buffer on present (the first version; two extra full-screen passes). */
+    KOMI_PORTRAIT_CANVAS,
+    /* Draw straight into the back buffer through the rotation: canvas
+       (x, y) is back buffer [x * KOMI_VRAM_STRIDE + 479 - y]. The video is
+       scaled and rotated in one tiled pass. */
+    KOMI_PORTRAIT_DIRECT
+} KomiOrientation;
+
+/* Direct portrait draws the video with the graphics engine unless this is
+   turned off (or sceGuInit failed); then with the CPU, in strips. */
+void komi_set_portrait_ge(bool enabled);
+bool komi_portrait_ge_active(void);
+void komi_portrait_ge_counts(unsigned *draws, uint64_t *wait_us,
+                             uint64_t *wait_max_us);
+void komi_portrait_ge_stage_counts(uint64_t *stage_us,
+                                   uint64_t *stage_max_us);
+
+/* Switch presentation (before drawing anything). */
+void komi_set_orientation(KomiOrientation orientation);
+KomiOrientation komi_orientation(void);
+/* How canvas (x, y) maps into the surface komi_canvas() returns:
+   surface + origin + x * step_x + y * step_y. */
+void komi_canvas_steps(long *step_x, long *step_y, long *origin);
+/* The surface programs draw on: the portrait canvas, or the back buffer
+   (landscape and direct portrait). NULL when there is no back buffer. */
 uint16_t *komi_canvas(void);
-/* Rotate the canvas into the back buffer (portrait) and show it. */
+/* Canvas pixel (x, y) of a surface komi_canvas() returned. */
+uint16_t komi_canvas_read(const uint16_t *surface, int x, int y);
+/* Rotate the canvas into the back buffer (canvas portrait) and show it. */
 void komi_canvas_present(void);
 
 typedef struct {
     uint64_t last_us;
     uint64_t identity;
     unsigned presented;
-    /* Portrait only: time spent scaling + rotating, for the log. */
+    /* Time per drawn frame, for the log: the whole draw, and each stage
+       (KOMI_STAGE_*) as a total and a maximum. */
     uint64_t draw_us;
     unsigned draws;
+    uint64_t stage_us[6];
+    uint64_t stage_max_us[6];
+    /* Frame loop gaps of 50 ms or more while playing, and what the frame
+       before each did. */
+    unsigned gaps;
+    uint64_t last_advance_us;
+    uint64_t advance_max_us;
+    uint64_t last_draw_us;
+    /* Audio output totals when the video opened (see komi_playback_audio). */
+    uint32_t audio_blocks_at_open;
+    uint32_t audio_starves_at_open;
+    uint32_t audio_gaps_at_open;
+    uint32_t audio_gap_us_at_open;
 } KomiPlayback;
+
+/* Remember the audio output totals at open; later, the blocks played and
+   the times the audio queue ran dry since then. */
+void komi_playback_audio_mark(KomiPlayback *state);
+void komi_playback_audio(const KomiPlayback *state, unsigned *blocks,
+                         unsigned *starves);
+/* "audio-blocks=.. starves=.. gaps=N gap-ms=.. gap-max=..us" since the
+   mark: gaps are output calls the DAC had to wait for (heard as crackle). */
+void komi_playback_audio_text(const KomiPlayback *state, char *out,
+                              size_t size);
+
+enum {
+    KOMI_STAGE_CLEAR,
+    KOMI_STAGE_PICTURE,
+    KOMI_STAGE_OVERLAY,
+    KOMI_STAGE_FEED,
+    KOMI_STAGE_ROTATE,
+    KOMI_STAGE_PUBLISH
+};
+
+/* "clear=a/b picture=..." (mean/max microseconds per drawn frame). */
+void komi_playback_stages(const KomiPlayback *state, char *out, size_t size);
 
 /* One frame of playback: advance the session, draw a new picture (or, when
    redraw is set, the current one again) with the overlay, feed, flip.
    Without a picture to draw it waits for the vertical blank instead. */
 void komi_playback_frame(KomiPlayback *state, KomiOverlay overlay,
                          void *context, bool redraw);
+/* Feed the codec worker (at most every 2 ms) from inside long drawing
+   work; komi_playback_frame does this itself. Programs may call it from
+   their overlay. On by default; off only for comparisons. */
+void komi_feed_tick(void);
+void komi_set_feed_ticks(bool enabled);
+void komi_feed_tick_counts(unsigned *ticks, unsigned *submits);
+
 /* Close the current video and wait (bounded) until its pipeline is gone. */
 void komi_playback_close(KomiPlayback *state);
 

@@ -15,17 +15,30 @@ typedef struct {
     FontGlyph glyph;
 } CachedGlyph;
 
-/* What ui_* draws on: the landscape back buffer unless a program switched
-   to another surface (the portrait canvas). */
+/* What ui_* draws on: pixel (x, y) is surface[origin + x * step_x +
+   y * step_y]. The landscape back buffer unless a program switched to
+   another surface (the portrait canvas, or the back buffer through a
+   rotation). */
 static int surface_width = KOMI_SCREEN_WIDTH;
 static int surface_height = KOMI_SCREEN_HEIGHT;
-static int surface_stride = KOMI_VRAM_STRIDE;
+static long surface_step_x = 1;
+static long surface_step_y = KOMI_VRAM_STRIDE;
+static long surface_origin = 0;
 
-void ui_set_surface(int width, int height, int stride)
+void ui_set_surface(int width, int height, long step_x, long step_y,
+                    long origin)
 {
     surface_width = width;
     surface_height = height;
-    surface_stride = stride;
+    surface_step_x = step_x;
+    surface_step_y = step_y;
+    surface_origin = origin;
+}
+
+static inline uint16_t *pixel_at(uint16_t *vram, int x, int y)
+{
+    return vram + surface_origin + (long) x * surface_step_x
+        + (long) y * surface_step_y;
 }
 
 static FontFace face;
@@ -64,30 +77,43 @@ static const FontGlyph *glyph_for(unsigned codepoint, int pixel_height)
     return &entry->glyph;
 }
 
+/* Clip a box to the surface; false when nothing is left. */
+static bool clip(int *x, int *y, int *width, int *height)
+{
+    if (*x < 0) { *width += *x; *x = 0; }
+    if (*y < 0) { *height += *y; *y = 0; }
+    if (*x + *width > surface_width) *width = surface_width - *x;
+    if (*y + *height > surface_height) *height = surface_height - *y;
+    return *width > 0 && *height > 0;
+}
+
+/* Visit a clipped box along whichever axis is contiguous in memory. */
+#define FOR_BOX(vram, x, y, width, height, p, body)                         \
+    do {                                                                    \
+        bool rows_contiguous = surface_step_x == 1 || surface_step_x == -1; \
+        int outer = rows_contiguous ? (height) : (width);                   \
+        int inner = rows_contiguous ? (width) : (height);                   \
+        long inner_step = rows_contiguous ? surface_step_x : surface_step_y;\
+        for (int o = 0; o < outer; o++) {                                   \
+            uint16_t *p = rows_contiguous                                   \
+                ? pixel_at(vram, (x), (y) + o)                              \
+                : pixel_at(vram, (x) + o, (y));                             \
+            for (int i = 0; i < inner; i++, p += inner_step) { body; }      \
+        }                                                                   \
+    } while (0)
+
 void ui_fill(uint16_t *vram, int x, int y, int width, int height,
              uint16_t color)
 {
-    if (x < 0) { width += x; x = 0; }
-    if (y < 0) { height += y; y = 0; }
-    if (x + width > surface_width) width = surface_width - x;
-    if (y + height > surface_height) height = surface_height - y;
-    for (int row = 0; row < height; row++) {
-        uint16_t *line = vram + (size_t) (y + row) * surface_stride + x;
-        for (int column = 0; column < width; column++) line[column] = color;
-    }
+    if (!clip(&x, &y, &width, &height)) return;
+    FOR_BOX(vram, x, y, width, height, p, *p = color);
 }
 
 void ui_shade(uint16_t *vram, int x, int y, int width, int height)
 {
-    if (x < 0) { width += x; x = 0; }
-    if (y < 0) { height += y; y = 0; }
-    if (x + width > surface_width) width = surface_width - x;
-    if (y + height > surface_height) height = surface_height - y;
-    for (int row = 0; row < height; row++) {
-        uint16_t *line = vram + (size_t) (y + row) * surface_stride + x;
-        for (int column = 0; column < width; column++)
-            line[column] = (uint16_t) ((line[column] >> 1) & 0x7BEFu);
-    }
+    if (!clip(&x, &y, &width, &height)) return;
+    FOR_BOX(vram, x, y, width, height, p,
+            *p = (uint16_t) ((*p >> 1) & 0x7BEFu));
 }
 
 static uint16_t blend(uint16_t over, uint16_t under, unsigned alpha)
@@ -111,12 +137,12 @@ static void draw_glyph(uint16_t *vram, int x, int baseline,
         if (y < 0 || y >= surface_height) continue;
         const unsigned char *coverage =
             glyph->pixels + (size_t) row * (size_t) glyph->width;
-        uint16_t *line = vram + (size_t) y * surface_stride;
         for (int column = 0; column < glyph->width; column++) {
             int px = left + column;
             unsigned alpha = coverage[column];
             if (alpha == 0 || px < 0 || px >= surface_width) continue;
-            line[px] = alpha >= 250u ? color : blend(color, line[px], alpha);
+            uint16_t *p = pixel_at(vram, px, y);
+            *p = alpha >= 250u ? color : blend(color, *p, alpha);
         }
     }
 }
@@ -126,7 +152,7 @@ static void draw_glyph(uint16_t *vram, int x, int baseline,
 static void plot(uint16_t *vram, int x, int y, uint16_t color)
 {
     if (x >= 0 && x < surface_width && y >= 0 && y < surface_height)
-        vram[(size_t) y * surface_stride + x] = color;
+        *pixel_at(vram, x, y) = color;
 }
 
 /* size x size box with its top-left at (x, y). */

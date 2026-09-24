@@ -2702,12 +2702,43 @@ static MediaBackendResult psp_media_raw_nal_probe_failed(
     return MEDIA_BACKEND_ERROR;
 }
 
+/* Process-wide mirrors of the audio worker's output counters, so programs
+   built without the validation log can see starvation (komi-tube native). */
+static _Atomic uint32_t psp_media_audio_blocks_total;
+static _Atomic uint32_t psp_media_audio_starves_total;
+/* Output calls that started later than one block after the previous call
+   returned: the hardware had nothing to play for that long (audible). */
+static _Atomic uint32_t psp_media_audio_gaps_total;
+static _Atomic uint32_t psp_media_audio_gap_us_total;
+static _Atomic uint32_t psp_media_audio_gap_max_us;
+
+void media_psp_backend_audio_output_counters(uint32_t *blocks,
+                                             uint32_t *starves)
+{
+    if (blocks != NULL) *blocks = atomic_load(&psp_media_audio_blocks_total);
+    if (starves != NULL)
+        *starves = atomic_load(&psp_media_audio_starves_total);
+}
+
+void media_psp_backend_audio_gap_counters(uint32_t *gaps, uint32_t *gap_us,
+                                          uint32_t *max_us)
+{
+    if (gaps != NULL) *gaps = atomic_load(&psp_media_audio_gaps_total);
+    if (gap_us != NULL) *gap_us = atomic_load(&psp_media_audio_gap_us_total);
+    if (max_us != NULL)
+        *max_us = atomic_exchange(&psp_media_audio_gap_max_us, 0u);
+}
+
 static int psp_media_audio_thread(SceSize argument_size, void *arguments)
 {
     PspMediaBackend *backend = NULL;
     if (arguments != NULL && argument_size == sizeof(backend))
         memcpy(&backend, arguments, sizeof(backend));
     if (backend == NULL) return -1;
+    uint64_t last_return_us = 0;
+    uint32_t block_us = backend->audio.sample_rate == 0 ? 23220u
+        : (uint32_t) ((uint64_t) PSP_MEDIA_AUDIO_SAMPLES * 1000000u
+                      / backend->audio.sample_rate);
     while (!backend->audio_stop) {
         uint32_t bits = 0;
         int waited = sceKernelWaitEventFlag(
@@ -2724,7 +2755,11 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
         if ((bits & PSP_MEDIA_AUDIO_EVENT_STOP) != 0
             || backend->audio_stop) break;
         if (!atomic_load(&backend->playing)
-            || atomic_load(&backend->buffering)) continue;
+            || atomic_load(&backend->buffering)) {
+            /* A pause or a rebuffer is silence on purpose. */
+            last_return_us = 0;
+            continue;
+        }
         /*
          * A wake-up with nothing to output is the audible failure mode of a
          * decoder that cannot keep 43 AAC blocks a second in front of the
@@ -2736,6 +2771,7 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
         if (atomic_load(&backend->audio_queue_read)
             == atomic_load(&backend->audio_queue_write)) {
             atomic_fetch_add(&backend->audio_output_starves, 1u);
+            atomic_fetch_add(&psp_media_audio_starves_total, 1u);
         }
         while (backend->audio_queue_read != backend->audio_queue_write
                && !backend->audio_stop
@@ -2761,6 +2797,18 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
                     0, memory_order_release);
                 break;
             }
+            uint64_t call_us = (uint64_t) sceKernelGetSystemTimeWide();
+            if (last_return_us != 0
+                && call_us - last_return_us > block_us) {
+                uint32_t gap = (uint32_t) (call_us - last_return_us
+                                           - block_us);
+                atomic_fetch_add(&psp_media_audio_gaps_total, 1u);
+                atomic_fetch_add(&psp_media_audio_gap_us_total, gap);
+                uint32_t seen = atomic_load(&psp_media_audio_gap_max_us);
+                while (gap > seen
+                       && !atomic_compare_exchange_weak(
+                              &psp_media_audio_gap_max_us, &seen, gap)) {}
+            }
             int status = backend->audio_channel == -2
                 ? sceAudioSRCOutputBlocking(
                     PSP_AUDIO_VOLUME_MAX,
@@ -2785,6 +2833,8 @@ static int psp_media_audio_thread(SceSize argument_size, void *arguments)
                 break;
             }
             atomic_fetch_add(&backend->audio_output_blocks, 1u);
+            atomic_fetch_add(&psp_media_audio_blocks_total, 1u);
+            last_return_us = (uint64_t) sceKernelGetSystemTimeWide();
             uint32_t first_output = 0u;
             uint32_t output_us = psp_media_stamp_us();
             if (output_us == 0u) output_us = 1u;

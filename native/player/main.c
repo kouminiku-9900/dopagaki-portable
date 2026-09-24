@@ -106,9 +106,10 @@ static void play_one(const char *id, unsigned index, uint64_t generation,
     unsigned used_peak = used_before;
     uint64_t started = komi_now_us();
     komi_progress("open");
+    KomiPlayback playback = {0};
+    komi_playback_audio_mark(&playback);
     bool accepted = psp_media_open_provider_route(media, url, generation);
 
-    KomiPlayback playback = {0};
     uint64_t first_frame_us = 0;
     uint64_t playing_since = 0;
     uint64_t buffering_us = 0;
@@ -147,9 +148,12 @@ static void play_one(const char *id, unsigned index, uint64_t generation,
     MediaBackendStats stats = {0};
     bool have_stats = psp_media_backend_stats_snapshot(media, &stats);
 
+    char audio[160];
+    komi_playback_audio_text(&playback, audio, sizeof audio);
     komi_playback_close(&playback);
     komi_clear_screen();
     unsigned used_after = komi_heap_used();
+    komi_result("audio id=%s %s", id, audio);
 
     komi_result("video %u id=%s %s outcome=%s first-frame=%llums "
                 "position=%llums frames=%u buffering=%llums "
