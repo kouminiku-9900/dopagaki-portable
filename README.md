@@ -62,12 +62,34 @@ PSPから次のサービスへ直接接続します。APIキーやアカウン�
 ```
 
 - `native/dopagaki/`：アプリ本体。`main.c`（画面・操作・再生の流れ）、`shorts.c`（YouTubeへの問い合わせ）、`shorts_parse.c`（応答の読み取り。Macでテスト）。
-- `native/common/komi_runtime.c`：Wi-Fi、通信、再生、画面の共通部分。縦持ち用に、272×480のキャンバスへ描いて90°回転して表示する処理を追加しています。
+- `native/common/komi_runtime.c`：Wi-Fi、通信、再生、画面の共通部分。縦持ち用に、動画はGE（PSPのグラフィックス）で90°回転・拡大縮小し、文字は回転した座標で直接描く処理を追加しています。
 - `native/app/`：komi-tube（新）のクライアント。漢字変換・マイリスト・文字描画はdopagakiからも使います。
 - 実機での自動試験：ビルド先（`vendor/tilefinch/build-preset-psp/dopagaki/`）に `dopagaki.cfg`（`autotest=1`）を置き、PSPLinkで `dopagaki.prx` を起動すると、おすすめ3本・検索・いいね・マイリストを自動で試して `dopagaki.txt` と縦向きのスクリーンショットを残します。詳しくは [docs/HANDOFF-DOPAGAKI.md](docs/HANDOFF-DOPAGAKI.md)。
 
 komi-tube由来のブラウザ版・ネイティブ版のビルド手順や経緯は [docs/HANDOFF.md](docs/HANDOFF.md)、[docs/HANDOFF-NATIVE.md](docs/HANDOFF-NATIVE.md) にそのまま残しています。
 
-## 出典・ライセンス
+## ありがとう
 
-このリポジトリ独自のコード・スクリプト・アイコンはMITライセンスです。komi-tube（MIT）をもとにしています。PSP本体側の通信・再生のコード（`vendor/tilefinch/`）は [Tilefinch](https://github.com/stjanovitz/tilefinch)（MIT、© Steven Janovitz）を取り込んで変更したものです。上流ソースとその依存ライブラリはそれぞれのライセンスに従い、配布ZIPの `NOTICES` に収録しています。YouTube、Sonyとは無関係の非公式プロジェクトです。
+このアプリがPSP単体でYouTubeにつながり、動画を再生できるのは、[Steven Janovitz](https://github.com/stjanovitz)さんが作った **[Tilefinch](https://github.com/stjanovitz/tilefinch)** のおかげです。HTTPS通信、YouTubeの動画情報の取得、PSPのメディアエンジンを使ったデコードなど、いちばん難しいところはほぼすべてTilefinchの成果の上に乗っています。PSPでここまでできるという道筋を示してくれたことに、心から感謝します。
+
+ほかにも、curl、mbed TLS、nghttp2、stbといったライブラリの作者の皆さん、フォントのTilefinch SansとGNU Unifontの作者の皆さん、PSPDEV（PSPSDK）を今も保守しているコミュニティの皆さんに感謝します。
+
+dopagaki-portableは、同じ作者の [komi-tube](https://github.com/kouminiku-9900/komi-tube) のネイティブ版をもとにしています。
+
+## ライセンス
+
+- **このリポジトリで書いたコード・スクリプト・アイコン**：MITライセンスです（[LICENSE](LICENSE)）。
+- **Tilefinch**（`vendor/tilefinch/`）：MITライセンス（© 2026 Steven Janovitz）。PSP向けに手を入れたものを取り込んでいます。元のライセンスは [vendor/tilefinch/LICENSE](vendor/tilefinch/LICENSE)、同梱ライブラリの一覧は [vendor/tilefinch/THIRD_PARTY_NOTICES.md](vendor/tilefinch/THIRD_PARTY_NOTICES.md) にあります。
+- **アプリに組み込まれている主なライブラリ**：curl（curlライセンス）、mbed TLS（Apache-2.0を選択）、nghttp2（MIT）、stb_truetype（MIT）、フォントのTilefinch SansとGNU Unifont（どちらもSIL OFL 1.1）、PSPSDK（BSD）、newlib（BSD系）、pthread-embedded（LGPL-2.1以降）。
+- **GPLのコードは含んでいません。** CFWの機能を呼び出す部分も、GPLのSDKではなく、Tilefinchが自前で書いたMITの宣言を使っています。
+- pthread-embeddedはLGPLです。このアプリのソースコードとビルド手順はすべてこのリポジトリで公開しているので、差し替えたライブラリでビルドし直すことができます。
+- 配布ZIPの `NOTICES` フォルダに、上のライセンス文と第三者通知をすべて入れています。
+
+## 免責事項
+
+- dopagaki-portableは個人が趣味で作った**非公式**のソフトです。YouTube、Google、ソニーグループ、Tilefinchの作者とは一切関係がなく、各社・各作者の承認も受けていません。YouTube、PSP、PlayStationは各社の商標です。
+- **無保証です。** このソフトを使ったこと、または使えなかったことによって生じたいかなる損害（本体の故障や起動不能、データの消失、通信費などを含みます）についても、作者は責任を負いません。すべて自己責任でお使いください。
+- CFW（カスタムファームウェア）の導入はこのリポジトリの対象外です。導入方法の案内やファイルの配布は行いません。
+- 非公式のアプリからYouTubeを見ることが、YouTubeの利用規約に沿っているかどうかは保証できません。ご自身で判断したうえでお使いください。動画のダウンロードや再配布、有料・会員限定コンテンツを見るための回避には使わないでください。表示される動画の権利は、それぞれの投稿者にあります。
+- YouTube側の仕組みが変わると、予告なく動かなくなることがあります。動作やサポートの継続は約束できません。
+- アプリは、アカウント情報やAPIキーを使いません。ただし、検索語（ひらがなで入力した場合はGoogleの変換サービスにも）はインターネットに送られます。
