@@ -1,0 +1,6215 @@
+#include "tilefinch/browser_engine.h"
+#include "tilefinch_test_faults.h"
+#include "tilefinch/page_find.h"
+#include "tilefinch/platform.h"
+#include "tilefinch/site_adapter.h"
+
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#define KIB (1024u)
+#define MIB (1024u * 1024u)
+#define BROWSER_PROVISIONAL_FRAME_LIMIT 2u
+#define BROWSER_PROVISIONAL_FINAL_RESERVE (1u * MIB)
+#define BROWSER_PROVISIONAL_GROW_MAX_ALLOC_US UINT64_C(100000)
+#define BROWSER_FONT_IDLE_READ_BYTES (16u * KIB)
+#define BROWSER_BLANK_READER_SETTLE_TICKS 12u
+#define BROWSER_RECOVERY_SETTLE_US UINT64_C(250000)
+
+typedef struct {
+    NavigationLoad *load;
+    SiteAdapterLoad *adapter;
+    DocumentBacking previous_backing;
+    BrowserNavigationJobStatus status;
+    TilefinchDiagnosticSubsystem failure_subsystem;
+    TilefinchDiagnosticCode failure_code;
+    size_t previous_history_index;
+    int restore_scroll_y;
+    int restore_focus_kind;
+    size_t restore_focus_index;
+    NavigationHistoryControl restore_controls[
+        NAVIGATION_HISTORY_CONTROL_LIMIT];
+    size_t restore_control_count;
+    BrowserNavigationJobMetrics metrics;
+    uint64_t started_us;
+    uint64_t generation;
+    bool previous_backing_valid;
+    bool hooks_installed;
+    bool history_move;
+    bool history_forward;
+    bool record_history;
+    char url[NAVIGATION_URL_LIMIT];
+} BrowserEngineNavigationWork;
+
+struct BrowserEngine {
+    BrowserConfig config;
+    Budget budget;
+    BrowserSession session;
+    ContentBlocker *content_blocker;
+    NavigationSession navigation;
+    BrowserController controller;
+    BrowserController candidate_controller;
+    FontSet fonts;
+    /* Completed optional reads are private until the whole bounded batch can
+       switch metrics in one transaction, not one page relayout per face. */
+    FontSet staged_fonts;
+    FontFaceLoad *font_load;
+    FontSetFaceMask font_loading_face;
+    uint64_t font_publication_retry_us;
+    TileCache render;
+    TileCache candidate_render;
+    uint16_t *provisional_frames;
+    size_t provisional_frame_count;
+    size_t provisional_current_frame;
+    size_t provisional_frame_pixels;
+    int provisional_scroll_positions[BROWSER_PROVISIONAL_FRAME_LIMIT];
+    bool provisional_ready;
+    DocumentBacking backing;
+    TilefinchDiagnostics diagnostics;
+    uint16_t *framebuffer;
+    size_t framebuffer_pixels;
+    BrowserEngineState state;
+    bool session_ready;
+    bool navigation_ready;
+    bool fonts_ready;
+    uint64_t startup_deferral_started_us;
+    const void *startup_deferral_runtime;
+    uint64_t startup_deferral_generation;
+    bool font_publication_guarded;
+    FontSetFaceMask font_requested_faces;
+    FontSetFaceMask font_failed_faces;
+    bool controller_ready;
+    bool render_ready;
+    bool candidate_controller_ready;
+    bool candidate_render_ready;
+    bool candidate_shell_prepared;
+    bool replacement_frame_frozen;
+    bool forced_dark;
+    bool youtube_compact_results;
+    bool autofocus_pending;
+    size_t render_relayout_generation;
+    uint64_t render_shell_serial;
+    size_t render_focus_paint_generation;
+    size_t unchanged_runtime_frames_suppressed;
+    PageFindIndex find;
+    uint64_t find_navigation_generation;
+    size_t find_layout_generation;
+    TilefinchDiagnosticSubsystem last_diagnostic_subsystem;
+    TilefinchDiagnosticCode last_diagnostic_code;
+    /* Compile-admission rejections already observed on the current page, so
+       each rejection produces one warning event rather than one per frame. */
+    size_t observed_compile_rejections;
+    uint64_t blank_reader_recovery_generation;
+    size_t blank_reader_recovery_first_runtime_tick;
+    uint64_t basic_view_recovery_generation;
+    size_t basic_view_recovery_first_runtime_tick;
+    uint64_t declared_media_recovery_generation;
+    size_t declared_media_recovery_first_runtime_tick;
+    lxb_dom_node_t *declared_media_card;
+    uint64_t declared_media_card_generation;
+    uint64_t declared_media_outcome_generation;
+    size_t declared_media_outcome_content_generation;
+    BrowserDeclaredMediaCard declared_media_outcome;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    BrowserEngineCreationMetrics creation_metrics;
+#endif
+    BrowserEngineNavigationWork navigation_work;
+    char last_error[256];
+};
+
+/* Lexbor exposes one process-global allocator table rather than a parser-local
+   allocator context. Keep the facade singleton explicit so a later engine
+   cannot redirect an earlier engine's DOM allocations or leave a dangling
+   allocator owner behind when it is destroyed. */
+static BrowserEngine *active_engine;
+
+static void browser_engine_restore_controls(
+    NavigationSession *navigation,
+    const NavigationHistoryControl *controls, size_t count);
+
+#if !defined(__PSP__)
+static uint64_t browser_engine_test_recovery_time_us;
+
+void browser_engine_test_refuse_next_render_shell_init(void)
+{
+    tilefinch_test_faults()->refuse_next_render_shell_init = true;
+}
+
+void browser_engine_test_set_recovery_time_us(uint64_t now_us)
+{
+    browser_engine_test_recovery_time_us = now_us;
+}
+
+static bool browser_engine_test_consume_render_shell_refusal(void)
+{
+    if (!tilefinch_test_faults()->refuse_next_render_shell_init) return false;
+    tilefinch_test_faults()->refuse_next_render_shell_init = false;
+    return true;
+}
+#else
+static bool browser_engine_test_consume_render_shell_refusal(void)
+{
+    return false;
+}
+#endif
+
+static uint64_t browser_engine_recovery_now_us(void)
+{
+#if !defined(__PSP__)
+    if (browser_engine_test_recovery_time_us != 0u)
+        return browser_engine_test_recovery_time_us;
+#endif
+    return tilefinch_platform_monotonic_time_us();
+}
+
+static bool browser_engine_input_ready(const BrowserEngine *engine);
+static bool browser_engine_finish_input(BrowserEngine *engine,
+                                        bool succeeded);
+static bool browser_engine_find_refresh(BrowserEngine *engine);
+static void browser_engine_deferred_reader_images_ready(
+    void *opaque, NavigationSession *navigation);
+
+static void copy_error(char *output, size_t capacity, const char *message)
+{
+    if (output == NULL || capacity == 0) return;
+    snprintf(output, capacity, "%s", message == NULL ? "" : message);
+}
+
+static bool emit_diagnostic(BrowserEngine *engine,
+                            TilefinchDiagnosticSeverity severity,
+                            TilefinchDiagnosticSubsystem subsystem,
+                            TilefinchDiagnosticCode code,
+                            const char *name, const char *detail,
+                            uint64_t value, uint64_t auxiliary)
+{
+    if (engine == NULL) return false;
+    engine->last_diagnostic_subsystem = subsystem;
+    engine->last_diagnostic_code = code;
+    return tilefinch_diagnostics_emit(
+        &engine->diagnostics, severity, subsystem, code, name, detail,
+        value, auxiliary);
+}
+
+static bool set_error_code(BrowserEngine *engine,
+                           TilefinchDiagnosticSubsystem subsystem,
+                           TilefinchDiagnosticCode code,
+                           const char *name, const char *message)
+{
+    if (engine != NULL) {
+        snprintf(engine->last_error, sizeof(engine->last_error), "%s",
+                 message == NULL ? "browser engine error" : message);
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_ERROR, subsystem, code, name,
+            engine->last_error, 0, 0);
+    }
+    return false;
+}
+
+static void clear_error(BrowserEngine *engine)
+{
+    if (engine == NULL) return;
+    engine->last_error[0] = '\0';
+}
+
+static bool copy_path(char output[BROWSER_ENGINE_PATH_LIMIT],
+                      const char *path)
+{
+    if (path == NULL) path = "";
+    size_t length = strlen(path);
+    if (length >= BROWSER_ENGINE_PATH_LIMIT) return false;
+    memcpy(output, path, length + 1);
+    return true;
+}
+
+static bool fixed_string_terminated(const char *value, size_t capacity)
+{
+    return value != NULL && memchr(value, '\0', capacity) != NULL;
+}
+
+void browser_device_profile_psp3000(BrowserDeviceProfile *profile)
+{
+    if (profile == NULL) return;
+    *profile = (BrowserDeviceProfile) {
+        .name = "psp-3000-333mhz",
+        .target_clock_mhz = 333,
+        .framebuffer_width = 480,
+        .framebuffer_height = 272,
+        .navigation_viewport_width = 480,
+        .recommended_memory_limit = BROWSER_PSP_REALISTIC_CONTENT_LIMIT,
+        .minimum_non_page_reserve =
+            BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE,
+        .maximum_tile_capacity = 8
+    };
+}
+
+void browser_config_init(BrowserConfig *config,
+                         const BrowserDeviceProfile *profile)
+{
+    if (config == NULL) return;
+    BrowserDeviceProfile selected;
+    if (profile == NULL) browser_device_profile_psp3000(&selected);
+    else selected = *profile;
+    *config = (BrowserConfig) {
+        .device = selected,
+        .non_page_memory_reserve = selected.minimum_non_page_reserve,
+        .memory_limit = selected.recommended_memory_limit,
+        .history_capacity = 16,
+        .session_cache_limit = 1u * MIB,
+        .maximum_document_bytes = 8u * MIB,
+        .navigation_timeout_ms = 20000,
+        .navigation_replacement_mode =
+            NAVIGATION_REPLACEMENT_TRANSACTIONAL,
+        .declared_css_width = 0,
+        .declared_css_height = 0,
+        .progressive_first_paint = true,
+        .tile_capacity = selected.maximum_tile_capacity < 8
+                         ? selected.maximum_tile_capacity : 8,
+        .idle_work_budget_us = 500,
+        .idle_work_maximum_units = 8,
+        .javascript = {
+            .enabled = false,
+            .document_scripts_enabled = false,
+            .heap_limit = 4u * MIB,
+            .runtime_timeout_ms = 10000,
+            .maximum_scripts = 48,
+            .maximum_total_bytes = 4u * MIB,
+            /* The realistic PSP execution policy admits one bounded Game
+               Profile script up to 384 KiB. Keep the ordinary aggregate
+               quota unchanged; strict mode narrows this unit to 256 KiB. */
+            .maximum_file_bytes = 384u * KIB,
+            .network_timeout_ms = 10000
+        },
+        /* About 22 us per layout work unit on the PSP-3000: a page above
+           200,000 units would spend more than four seconds reflowing for an
+           optional font or image batch. */
+        .startup_resource_deferral_us = 3000000u,
+        .resources = {
+            .maximum_publication_work_units = 200000u,
+            .enabled = false,
+            .web_fonts_enabled = true,
+            .maximum_stylesheets = 16,
+            .maximum_stylesheet_bytes = 2u * MIB,
+            .maximum_stylesheet_file_bytes = 512u * KIB,
+            .maximum_font_attempts = 8,
+            .maximum_font_bytes = 256u * KIB,
+            .maximum_font_file_bytes = 96u * KIB,
+            .maximum_font_face_backend_bytes = 256u * KIB,
+            .maximum_images = 24,
+            .maximum_image_bytes = 4u * MIB,
+            .maximum_image_file_bytes = 1u * MIB,
+            .maximum_decoded_image_bytes = 4u * MIB,
+            .timeout_ms = 10000
+        },
+        .fonts = {
+            .maximum_publication_work_units = 200000u,
+            .enabled = false,
+            .maximum_total_bytes = 1536u * KIB
+        }
+    };
+    (void) script_execution_policy_for_profile(
+        SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC,
+        &config->javascript.execution_policy);
+}
+
+bool browser_config_apply_psp_memory_profile(
+    BrowserConfig *config, BrowserPspMemoryProfile profile)
+{
+    if (config == NULL
+        || (profile != BROWSER_PSP_MEMORY_STRICT
+            && profile != BROWSER_PSP_MEMORY_REALISTIC)) return false;
+    bool strict = profile == BROWSER_PSP_MEMORY_STRICT;
+    config->memory_limit = strict
+        ? BROWSER_PSP_STRICT_CONTENT_LIMIT
+        : BROWSER_PSP_REALISTIC_CONTENT_LIMIT;
+    config->non_page_memory_reserve =
+        BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE;
+    config->history_capacity = strict ? 8 : 16;
+    config->session_cache_limit = strict ? 512u * KIB : 1u * MIB;
+    config->tile_capacity = config->device.maximum_tile_capacity < 8
+        ? config->device.maximum_tile_capacity : 8;
+    config->javascript.heap_limit = strict ? 4u * MIB : 5u * MIB;
+    size_t script_source_limit = strict ? 1u * MIB : 2u * MIB;
+    if (config->javascript.maximum_total_bytes > script_source_limit)
+        config->javascript.maximum_total_bytes = script_source_limit;
+    size_t script_file_limit = strict ? 256u * KIB : 384u * KIB;
+    if (config->javascript.maximum_file_bytes > script_file_limit)
+        config->javascript.maximum_file_bytes = script_file_limit;
+    return script_execution_policy_for_profile(
+        strict ? SCRIPT_EXECUTION_PROFILE_PSP_STRICT
+               : SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC,
+        &config->javascript.execution_policy);
+}
+
+bool browser_config_set_font_paths(
+    BrowserConfig *config, const char *sans_path, const char *serif_path,
+    const char *sans_italic_path, const char *sans_bold_path,
+    const char *serif_bold_path, const char *metric_sans_path,
+    const char *metric_sans_bold_path, size_t maximum_total_bytes)
+{
+    if (config == NULL || maximum_total_bytes == 0
+        || ((sans_path == NULL || sans_path[0] == '\0')
+            && (serif_path == NULL || serif_path[0] == '\0')
+            && (sans_italic_path == NULL || sans_italic_path[0] == '\0')
+            && (sans_bold_path == NULL || sans_bold_path[0] == '\0')
+            && (serif_bold_path == NULL || serif_bold_path[0] == '\0')
+            && (metric_sans_path == NULL || metric_sans_path[0] == '\0')
+            && (metric_sans_bold_path == NULL
+                || metric_sans_bold_path[0] == '\0'))) {
+        return false;
+    }
+    BrowserFontConfig candidate = config->fonts;
+    if (!copy_path(candidate.sans_path, sans_path)
+        || !copy_path(candidate.serif_path, serif_path)
+        || !copy_path(candidate.sans_italic_path, sans_italic_path)
+        || !copy_path(candidate.sans_bold_path, sans_bold_path)
+        || !copy_path(candidate.serif_bold_path, serif_bold_path)
+        || !copy_path(candidate.metric_sans_path, metric_sans_path)
+        || !copy_path(candidate.metric_sans_bold_path,
+                      metric_sans_bold_path)) {
+        return false;
+    }
+    candidate.maximum_total_bytes = maximum_total_bytes;
+    candidate.enabled = true;
+    config->fonts = candidate;
+    return true;
+}
+
+void browser_config_set_staged_font_loading(
+    BrowserConfig *config, bool staged)
+{
+    if (config != NULL) config->fonts.staged_loading = staged;
+}
+
+static bool browser_engine_load_font_faces(
+    BrowserEngine *engine, FontSetFaceMask faces)
+{
+    if (engine == NULL || !engine->config.fonts.enabled) return false;
+    const BrowserFontConfig *fonts = &engine->config.fonts;
+    return font_set_load_selected(
+        &engine->fonts, &engine->budget, fonts->sans_path,
+        fonts->serif_path, fonts->sans_italic_path,
+        fonts->sans_bold_path, fonts->serif_bold_path,
+        fonts->metric_sans_path, fonts->metric_sans_bold_path,
+        fonts->maximum_total_bytes, faces);
+}
+
+static void browser_engine_discard_staged_fonts(BrowserEngine *engine)
+{
+    font_face_load_destroy(engine->font_load);
+    engine->font_load = NULL;
+    engine->font_loading_face = 0;
+    font_set_destroy(&engine->staged_fonts);
+}
+
+#define BROWSER_BASELINE_FONT_FACES ((FontSetFaceMask) (                 \
+    FONT_SET_FACE_SANS | FONT_SET_FACE_METRIC_SANS))
+
+/* Built-in provider documents are authored by Tilefinch and have a stable
+   typography contract. Load the one page face they use before admitting the
+   navigation, so the committed document is never first shown with synthetic
+   bold metrics and then laid out again when idle work reaches the font. */
+#define BROWSER_PROVIDER_FONT_FACES ((FontSetFaceMask) (                 \
+    FONT_SET_FACE_SANS_BOLD | FONT_SET_FACE_METRIC_SANS_BOLD))
+
+bool browser_engine_prepare_native_home_font(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE)
+        return false;
+    if (!engine->config.fonts.enabled || engine->fonts.sans.loaded)
+        return true;
+    if ((engine->font_failed_faces & FONT_SET_FACE_SANS) != 0)
+        return false;
+    if (!browser_engine_load_font_faces(engine, FONT_SET_FACE_SANS)) {
+        /* Keep the fallback stable for this process if the one required file
+           is unavailable; the later baseline pump must not make HOME change
+           typography after the failure. */
+        engine->font_failed_faces |= FONT_SET_FACE_SANS;
+        return false;
+    }
+    return true;
+}
+
+const FontFace *browser_engine_native_home_font(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+            && engine->fonts.sans.loaded
+        ? &engine->fonts.sans : NULL;
+}
+
+bool browser_engine_baseline_fonts_ready(const BrowserEngine *engine)
+{
+    return engine != NULL
+        && (!engine->config.fonts.enabled || engine->fonts_ready);
+}
+
+bool browser_engine_pump_baseline_fonts(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE)
+        return false;
+    if (!engine->config.fonts.enabled) return true;
+    if (engine->fonts_ready) return true;
+    if ((engine->font_failed_faces & BROWSER_BASELINE_FONT_FACES) != 0)
+        return false;
+    const FontSetFaceMask order[] = {
+        FONT_SET_FACE_SANS, FONT_SET_FACE_METRIC_SANS
+    };
+    FontSetFaceMask loaded = 0;
+    if (engine->fonts.sans.loaded) loaded |= FONT_SET_FACE_SANS;
+    if (engine->fonts.metric_sans.loaded)
+        loaded |= FONT_SET_FACE_METRIC_SANS;
+    for (size_t at = 0; at < sizeof(order) / sizeof(order[0]); at++) {
+        if ((loaded & order[at]) != 0) continue;
+        if (!browser_engine_load_font_faces(engine, order[at])) {
+            engine->font_failed_faces |= order[at];
+            return false;
+        }
+        loaded |= order[at];
+        break;
+    }
+    engine->fonts_ready =
+        (loaded & BROWSER_BASELINE_FONT_FACES)
+            == BROWSER_BASELINE_FONT_FACES;
+    return true;
+}
+
+static bool browser_engine_ensure_baseline_fonts(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->config.fonts.enabled) return true;
+    while (!engine->fonts_ready) {
+        if (!browser_engine_pump_baseline_fonts(engine)) return false;
+    }
+    return true;
+}
+
+static FontSetFaceMask browser_engine_loaded_font_faces(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL) return 0;
+    FontSetFaceMask loaded = 0;
+    if (engine->fonts.sans.loaded) loaded |= FONT_SET_FACE_SANS;
+    if (engine->fonts.serif.loaded) loaded |= FONT_SET_FACE_SERIF;
+    if (engine->fonts.sans_italic.loaded)
+        loaded |= FONT_SET_FACE_SANS_ITALIC;
+    if (engine->fonts.sans_bold.loaded) loaded |= FONT_SET_FACE_SANS_BOLD;
+    if (engine->fonts.serif_bold.loaded)
+        loaded |= FONT_SET_FACE_SERIF_BOLD;
+    if (engine->fonts.metric_sans.loaded)
+        loaded |= FONT_SET_FACE_METRIC_SANS;
+    if (engine->fonts.metric_sans_bold.loaded)
+        loaded |= FONT_SET_FACE_METRIC_SANS_BOLD;
+    return loaded;
+}
+
+bool browser_engine_prepare_navigation_fonts(
+    BrowserEngine *engine, const char *method, const char *url)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || method == NULL || url == NULL) return false;
+    if (!browser_engine_ensure_baseline_fonts(engine)) return false;
+    if (!site_adapter_navigation_requires_stable_typography(method, url)
+        || !engine->config.fonts.enabled) return true;
+
+    FontSetFaceMask requested = BROWSER_PROVIDER_FONT_FACES;
+    engine->font_requested_faces |= requested;
+    FontSetFaceMask missing = requested
+        & (FontSetFaceMask) ~(browser_engine_loaded_font_faces(engine)
+                             | engine->font_failed_faces);
+    if (missing == 0) return true;
+
+    /* Navigation already suppresses optional idle work. Drop any partial
+       staging allocation as well, otherwise it can make the trusted provider
+       face lose an otherwise-valid bounded-budget admission. */
+    browser_engine_discard_staged_fonts(engine);
+
+    FontSetFaceMask loaded_before = browser_engine_loaded_font_faces(engine);
+    const FontSetFaceMask order[] = {
+        FONT_SET_FACE_SANS_BOLD, FONT_SET_FACE_METRIC_SANS_BOLD
+    };
+    for (size_t at = 0; at < sizeof(order) / sizeof(order[0]); at++) {
+        FontSetFaceMask face = order[at];
+        if ((missing & face) == 0) continue;
+        if (!browser_engine_load_font_faces(engine, face)) {
+            /* Optional faces fail stable: keep the fallback for the whole
+               document instead of revealing a late metric transition. */
+            engine->font_failed_faces |= face;
+        }
+    }
+    FontSetFaceMask loaded_after = browser_engine_loaded_font_faces(engine);
+    FontSetFaceMask newly_loaded = loaded_after
+        & (FontSetFaceMask) ~loaded_before;
+    if (newly_loaded == 0) return true;
+
+    /* A still-visible incumbent may also use bold text. Keep rollback pixels
+       and geometry coherent before the candidate begins. */
+    if ((newly_loaded & FONT_SET_FACE_SANS_BOLD) != 0
+        && engine->navigation.page.loaded
+        && !navigation_relayout(&engine->navigation)) {
+        font_face_destroy(&engine->fonts.sans_bold);
+        engine->font_failed_faces |= FONT_SET_FACE_SANS_BOLD;
+        newly_loaded &= (FontSetFaceMask) ~FONT_SET_FACE_SANS_BOLD;
+    }
+    if (engine->render_ready && newly_loaded != 0)
+        tile_cache_invalidate_glyphs(&engine->render);
+    return true;
+}
+
+bool browser_config_validate(const BrowserConfig *config,
+                             char *error, size_t error_capacity)
+{
+#define CONFIG_REQUIRE(condition, message) do {                              \
+    if (!(condition)) { copy_error(error, error_capacity, (message));        \
+                       return false; }                                       \
+} while (0)
+    CONFIG_REQUIRE(config != NULL, "configuration is required");
+    CONFIG_REQUIRE(fixed_string_terminated(
+                       config->device.name, sizeof(config->device.name))
+                       && config->device.name[0] != '\0',
+                   "device profile name must be bounded and nonempty");
+    CONFIG_REQUIRE(config->device.framebuffer_width > 0
+                       && config->device.framebuffer_height > 0
+                       && config->device.navigation_viewport_width > 0,
+                   "device dimensions must be positive");
+    CONFIG_REQUIRE(config->device.framebuffer_width <= 4096
+                       && config->device.framebuffer_height <= 4096,
+                   "device dimensions exceed the bounded renderer limit");
+    size_t width = (size_t) config->device.framebuffer_width;
+    size_t height = (size_t) config->device.framebuffer_height;
+    CONFIG_REQUIRE(width <= SIZE_MAX / height
+                       && width * height <= SIZE_MAX / sizeof(uint16_t),
+                   "framebuffer dimensions overflow size_t");
+    CONFIG_REQUIRE(config->memory_limit != 0,
+                   "content memory limit must be nonzero");
+    CONFIG_REQUIRE(config->non_page_memory_reserve
+                       <= SIZE_MAX - config->memory_limit,
+                   "content limit and non-page reserve overflow size_t");
+    CONFIG_REQUIRE(config->non_page_memory_reserve
+                       >= config->device.minimum_non_page_reserve,
+                   "non-page reserve is below the device profile minimum");
+    CONFIG_REQUIRE(config->history_capacity != 0
+                       && config->history_capacity <= 64,
+                   "history capacity must be between 1 and 64");
+    CONFIG_REQUIRE(config->session_cache_limit != 0
+                       && config->session_cache_limit < config->memory_limit,
+                   "session cache must fit inside the content budget");
+    CONFIG_REQUIRE(config->maximum_document_bytes != 0
+                       && config->navigation_timeout_ms > 0,
+                   "navigation limits must be nonzero");
+    CONFIG_REQUIRE(
+        config->navigation_replacement_mode
+                == NAVIGATION_REPLACEMENT_TRANSACTIONAL
+            || config->navigation_replacement_mode
+                == NAVIGATION_REPLACEMENT_LOW_MEMORY,
+        "navigation replacement mode is invalid");
+    CONFIG_REQUIRE(
+        (config->declared_css_width == 0
+         && config->declared_css_height == 0)
+            || (config->declared_css_width > 0
+                && config->declared_css_width <= 4096
+                && config->declared_css_height > 0
+                && config->declared_css_height <= 4096),
+        "declared CSS viewport must be zero or a bounded dimension pair");
+    CONFIG_REQUIRE(config->device.maximum_tile_capacity == 0
+                       || config->tile_capacity
+                              <= config->device.maximum_tile_capacity,
+                   "tile capacity exceeds the device profile");
+    CONFIG_REQUIRE(config->idle_work_budget_us > 0
+                       && config->idle_work_budget_us <= 1000000
+                       && config->idle_work_maximum_units > 0
+                       && config->idle_work_maximum_units <= 64,
+                   "idle work limits must be bounded and nonzero");
+    CONFIG_REQUIRE(!config->javascript.enabled
+                       || (config->javascript.heap_limit != 0
+                           && config->javascript.runtime_timeout_ms != 0),
+                   "JavaScript heap and runtime limits must be nonzero");
+    CONFIG_REQUIRE(!config->javascript.document_scripts_enabled
+                       || (config->javascript.enabled
+                           && config->javascript.maximum_scripts != 0
+                           && config->javascript.maximum_total_bytes != 0
+                           && config->javascript.maximum_file_bytes != 0
+                           && config->javascript.network_timeout_ms > 0),
+                   "document scripts require complete JavaScript limits");
+    CONFIG_REQUIRE(
+        !config->javascript.document_scripts_enabled
+            || config->javascript.execution_policy
+                       .maximum_host_compile_source_bytes == 0
+            || config->javascript.maximum_file_bytes
+                 <= config->javascript.execution_policy
+                        .maximum_host_compile_source_bytes,
+        "script response limit exceeds the host compile admission limit");
+    CONFIG_REQUIRE(
+        (config->javascript.execution_policy
+                 .maximum_host_compile_projected_us == 0)
+            == (config->javascript.execution_policy
+                    .modeled_compile_bytes_per_ms == 0),
+        "projected compile admission requires both the time budget and the "
+        "modeled throughput");
+    CONFIG_REQUIRE(!config->resources.enabled
+                       || (config->resources.maximum_stylesheets != 0
+                           && config->resources.maximum_stylesheet_bytes != 0
+                           && config->resources.maximum_stylesheet_file_bytes
+                                  != 0
+                           && config->resources.maximum_images != 0
+                           && config->resources.maximum_image_bytes != 0
+                           && config->resources.maximum_image_file_bytes != 0
+                           && config->resources.maximum_decoded_image_bytes
+                                  != 0
+                           && config->resources.timeout_ms > 0),
+                   "external resources require complete bounded limits");
+    CONFIG_REQUIRE(
+        !config->resources.enabled
+            || !config->resources.web_fonts_enabled
+            || (config->resources.maximum_font_attempts != 0
+                && config->resources.maximum_font_attempts
+                    <= TILEFINCH_WEB_FONT_FAMILY_LIMIT * 2u
+                       * STYLE_WEB_FONT_SOURCE_LIMIT
+                && config->resources.maximum_font_bytes != 0
+                && config->resources.maximum_font_file_bytes != 0
+                && config->resources.maximum_font_file_bytes
+                    <= config->resources.maximum_font_bytes
+                && config->resources.maximum_font_face_backend_bytes != 0),
+        "web fonts require complete bounded limits");
+    CONFIG_REQUIRE(!config->fonts.enabled
+                       || config->fonts.maximum_total_bytes != 0,
+                   "enabled fonts require a nonzero byte limit");
+    CONFIG_REQUIRE(
+        !config->fonts.enabled
+            || (fixed_string_terminated(
+                    config->fonts.sans_path,
+                    sizeof(config->fonts.sans_path))
+                && fixed_string_terminated(
+                    config->fonts.serif_path,
+                    sizeof(config->fonts.serif_path))
+                && fixed_string_terminated(
+                    config->fonts.sans_italic_path,
+                    sizeof(config->fonts.sans_italic_path))
+                && fixed_string_terminated(
+                    config->fonts.sans_bold_path,
+                    sizeof(config->fonts.sans_bold_path))
+                && fixed_string_terminated(
+                    config->fonts.serif_bold_path,
+                    sizeof(config->fonts.serif_bold_path))
+                && fixed_string_terminated(
+                    config->fonts.metric_sans_path,
+                    sizeof(config->fonts.metric_sans_path))
+                && fixed_string_terminated(
+                    config->fonts.metric_sans_bold_path,
+                    sizeof(config->fonts.metric_sans_bold_path))),
+        "font paths must be bounded strings");
+    CONFIG_REQUIRE(
+        !config->fonts.enabled
+            || config->fonts.sans_path[0] != '\0'
+            || config->fonts.serif_path[0] != '\0'
+            || config->fonts.sans_italic_path[0] != '\0'
+            || config->fonts.sans_bold_path[0] != '\0'
+            || config->fonts.serif_bold_path[0] != '\0'
+            || config->fonts.metric_sans_path[0] != '\0'
+            || config->fonts.metric_sans_bold_path[0] != '\0',
+        "enabled fonts require at least one font path");
+    CONFIG_REQUIRE(config->diagnostics.minimum_severity
+                       >= TILEFINCH_DIAGNOSTIC_DEBUG
+                       && config->diagnostics.minimum_severity
+                              <= TILEFINCH_DIAGNOSTIC_ERROR,
+                   "diagnostic severity is invalid");
+    copy_error(error, error_capacity, "");
+    return true;
+#undef CONFIG_REQUIRE
+}
+
+static void browser_engine_reset_render_shell(BrowserEngine *engine)
+{
+    if (engine == NULL) return;
+    if (engine->render_ready) tile_cache_destroy(&engine->render);
+    else memset(&engine->render, 0, sizeof(engine->render));
+    engine->render_ready = false;
+    engine->render_relayout_generation = 0;
+    engine->render_focus_paint_generation = 0;
+}
+
+static void browser_engine_reset_shell(BrowserEngine *engine)
+{
+    if (engine == NULL) return;
+    browser_engine_reset_render_shell(engine);
+    memset(&engine->controller, 0, sizeof(engine->controller));
+    engine->controller_ready = false;
+}
+
+static bool browser_engine_init_tile_cache(
+    BrowserEngine *engine, TileCache *cache, const LayoutDocument *layout,
+    size_t tile_capacity)
+{
+    if (engine == NULL || cache == NULL || layout == NULL
+        || !tile_cache_init(
+               cache, &engine->budget, layout, tile_capacity)) {
+        return false;
+    }
+    tile_cache_set_forced_dark(cache, engine->forced_dark);
+    return true;
+}
+
+static void browser_engine_reset_provisional_viewport(BrowserEngine *engine)
+{
+    if (engine == NULL) return;
+    budget_free(&engine->budget, engine->provisional_frames);
+    engine->provisional_frames = NULL;
+    engine->provisional_frame_count = 0;
+    engine->provisional_current_frame = 0;
+    engine->provisional_frame_pixels = 0;
+    memset(engine->provisional_scroll_positions, 0,
+           sizeof(engine->provisional_scroll_positions));
+    engine->provisional_ready = false;
+}
+
+static bool browser_engine_initialize_render_shell(
+    BrowserEngine *engine, const char *diagnostic_name,
+    const char *failure_message)
+{
+    if (browser_engine_test_consume_render_shell_refusal()) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, diagnostic_name,
+            failure_message);
+    }
+    if (engine->config.tile_capacity == 0) {
+        clear_error(engine);
+        return true;
+    }
+    if (engine->framebuffer == NULL
+        || !browser_engine_init_tile_cache(
+               engine, &engine->render,
+               &engine->navigation.page.layout,
+               engine->config.tile_capacity)
+        || !tile_cache_set_frame(
+               &engine->render, engine->framebuffer,
+               engine->framebuffer_pixels)) {
+        if (engine->render.budget != NULL)
+            tile_cache_destroy(&engine->render);
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, diagnostic_name,
+            failure_message);
+    }
+    engine->render_ready = true;
+    engine->render_shell_serial++;
+    engine->render_relayout_generation =
+        engine->navigation.incremental_relayouts;
+    engine->render_focus_paint_generation =
+        engine->navigation.focus_paint_generation;
+    clear_error(engine);
+    return true;
+}
+
+static void browser_engine_paint_replacement_failure(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->framebuffer == NULL
+        || engine->framebuffer_pixels == 0) return;
+    size_t width = (size_t) engine->config.device.framebuffer_width;
+    size_t height = (size_t) engine->config.device.framebuffer_height;
+    if (width == 0 || height == 0
+        || width > engine->framebuffer_pixels / height) return;
+    uint16_t *frame = engine->framebuffer;
+    if (!engine->replacement_frame_frozen) {
+        for (size_t i = 0; i < width * height; i++) frame[i] = UINT16_C(0xef7d);
+    }
+    size_t banner_height = height < 40 ? height : 40;
+    for (size_t y = 0; y < banner_height; y++) {
+        for (size_t x = 0; x < width; x++) {
+            frame[y * width + x] = y < 3 ? UINT16_C(0xffff)
+                                         : UINT16_C(0xb104);
+        }
+    }
+    /* Allocation-free retry glyph: a white return arrow in the fixed banner.
+       The detailed failure text remains in NavigationSession for assistive
+       UI and logs rather than requiring a font allocation here. */
+    size_t center_x = width < 30 ? width / 2 : width - 22;
+    size_t center_y = banner_height / 2;
+    for (size_t x = center_x > 8 ? center_x - 8 : 0;
+         x < width && x <= center_x + 6; x++) {
+        if (center_y < height) frame[center_y * width + x] = UINT16_C(0xffff);
+    }
+    for (size_t d = 0; d < 7; d++) {
+        size_t x = center_x > 8 ? center_x - 8 + d : d;
+        if (x >= width) break;
+        if (center_y >= d && center_y - d < height)
+            frame[(center_y - d) * width + x] = UINT16_C(0xffff);
+        if (center_y + d < height)
+            frame[(center_y + d) * width + x] = UINT16_C(0xffff);
+    }
+}
+
+static bool browser_engine_freeze_replacement_frame(
+    void *opaque, const NavigationSession *incumbent)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || incumbent != &engine->navigation) return false;
+    bool frozen = engine->framebuffer != NULL && engine->render_ready
+        && engine->render.frames_rendered != 0;
+    engine->replacement_frame_frozen = frozen;
+    browser_engine_reset_shell(engine);
+    return frozen;
+}
+
+static void browser_engine_replacement_outcome(
+    void *opaque, const NavigationSession *session, bool success)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || session != &engine->navigation) return;
+    if (!success) browser_engine_paint_replacement_failure(engine);
+    else engine->replacement_frame_frozen = false;
+}
+
+static void browser_engine_abort_candidate_shell(void *opaque)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL) return;
+    if (engine->candidate_render.budget != NULL)
+        tile_cache_destroy(&engine->candidate_render);
+    else
+        memset(&engine->candidate_render, 0,
+               sizeof(engine->candidate_render));
+    memset(&engine->candidate_controller, 0,
+           sizeof(engine->candidate_controller));
+    engine->candidate_controller_ready = false;
+    engine->candidate_render_ready = false;
+    engine->candidate_shell_prepared = false;
+}
+
+/* Form/focus history state belongs to one document request. Fragment-only
+   entries share that document; redirects and even same-origin path changes do
+   not. Normalize before removing the fragment so equivalent URL spelling does
+   not accidentally disable legitimate same-document restoration. */
+static bool browser_engine_history_url_matches_document(
+    const char *history_url, const char *document_url)
+{
+    char history[NAVIGATION_URL_LIMIT];
+    char document[NAVIGATION_URL_LIMIT];
+    if (history_url == NULL || document_url == NULL
+        || !tilefinch_url_normalize(history_url, history, sizeof(history))
+        || !tilefinch_url_normalize(
+               document_url, document, sizeof(document))) return false;
+    char *fragment = strchr(history, '#');
+    if (fragment != NULL) *fragment = '\0';
+    fragment = strchr(document, '#');
+    if (fragment != NULL) *fragment = '\0';
+    return strcmp(history, document) == 0;
+}
+
+static bool browser_engine_prepare_candidate_shell(
+    void *opaque, NavigationSession *candidate)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || candidate == NULL || candidate->budget != &engine->budget
+        || !candidate->page.loaded) {
+        return false;
+    }
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    if (work->history_move) {
+        const NavigationEntry *target = navigation_current(
+            &engine->navigation);
+        if (target != NULL
+            && browser_engine_history_url_matches_document(
+                   target->url, candidate->page.document_url)) {
+            browser_engine_restore_controls(
+                candidate, work->restore_controls,
+                work->restore_control_count);
+        } else {
+            /* The response redirected or otherwise committed a different
+               document.  Ordinal control state belongs to the requested
+               history document and must never populate an unrelated form. */
+            work->restore_control_count = 0u;
+        }
+    }
+    bool keep_progressive_render = engine->candidate_render_ready
+        && engine->candidate_render.budget == &engine->budget
+        && engine->candidate_render.source_layout
+               == &candidate->page.layout;
+    if (!keep_progressive_render) {
+        browser_engine_abort_candidate_shell(engine);
+    } else {
+        /* The progressive callback already rasterized this exact final
+           layout. Preserve its bounded tile and decoded-image caches; only
+           the controller side of the transaction remains to be prepared. */
+        memset(&engine->candidate_controller, 0,
+               sizeof(engine->candidate_controller));
+        engine->candidate_controller_ready = false;
+        engine->candidate_shell_prepared = false;
+    }
+    if (!controller_init(&engine->candidate_controller,
+                         candidate)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "candidate-controller",
+            "candidate controller initialization failed");
+    }
+    engine->candidate_controller_ready = true;
+    if (engine->config.tile_capacity != 0 && !keep_progressive_render) {
+        bool injected_refusal =
+            browser_engine_test_consume_render_shell_refusal();
+        if (injected_refusal)
+            budget_inject_failure_after(&engine->budget, 0u);
+        if (engine->framebuffer == NULL
+            || !browser_engine_init_tile_cache(
+                   engine, &engine->candidate_render,
+                   &candidate->page.layout, engine->config.tile_capacity)
+            || !tile_cache_set_frame(
+                   &engine->candidate_render, engine->framebuffer,
+                   engine->framebuffer_pixels)) {
+            if (injected_refusal)
+                budget_clear_failure_injection(&engine->budget);
+            return set_error_code(
+                engine, TILEFINCH_SUBSYSTEM_RENDER,
+                TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED,
+                "candidate-render",
+                "candidate render shell exceeded its bounded memory");
+        }
+        engine->candidate_render_ready = true;
+    }
+    engine->candidate_shell_prepared = true;
+    return true;
+}
+
+static void browser_engine_commit_candidate_shell(void *opaque)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || !engine->candidate_shell_prepared) return;
+    browser_engine_reset_shell(engine);
+    engine->controller = engine->candidate_controller;
+    /* A streamed URL candidate is built in a temporary NavigationSession
+       which is memcpy-promoted immediately before this no-fail callback. */
+    engine->controller.navigation = &engine->navigation;
+    engine->controller_ready = engine->candidate_controller_ready;
+    engine->render = engine->candidate_render;
+    engine->render.source_layout = &engine->navigation.page.layout;
+    if (engine->render.owns_visual_layout) {
+        engine->render.layout = &engine->render.visual_layout;
+    } else {
+        engine->render.layout = engine->render.source_layout;
+    }
+    engine->render_ready = engine->candidate_render_ready;
+    engine->render_shell_serial++;
+    engine->render_relayout_generation =
+        engine->navigation.incremental_relayouts;
+    engine->render_focus_paint_generation =
+        engine->navigation.focus_paint_generation;
+    memset(&engine->candidate_controller, 0,
+           sizeof(engine->candidate_controller));
+    memset(&engine->candidate_render, 0,
+           sizeof(engine->candidate_render));
+    engine->candidate_controller_ready = false;
+    engine->candidate_render_ready = false;
+    engine->candidate_shell_prepared = false;
+}
+
+static bool browser_engine_capture_provisional_viewport(
+    BrowserEngine *engine, NavigationSession *candidate,
+    const LayoutDocument *layout, size_t width, size_t height)
+{
+    if (engine == NULL || candidate == NULL || layout == NULL
+        || width == 0 || height == 0
+        || engine->config.tile_capacity == 0
+        || width > SIZE_MAX / height) return false;
+    if (engine->navigation_work.metrics.provisional_capture_started_us == 0) {
+        uint64_t now_us =
+            tilefinch_platform_monotonic_time_us();
+        engine->navigation_work.metrics.provisional_capture_started_us =
+            now_us >= engine->navigation_work.started_us
+                ? now_us - engine->navigation_work.started_us : 0;
+    }
+    size_t pixels = width * height;
+    if (pixels > SIZE_MAX / sizeof(uint16_t)) return false;
+    int viewport_height = candidate->viewport.css_height;
+    if (viewport_height <= 0) viewport_height = (int) height;
+    int maximum_scroll = layout->height > viewport_height
+        ? layout->height - viewport_height : 0;
+    /* The retained snapshot window is deliberately one page, not an
+       unbounded alternate document surface. The authoritative page owns
+       deeper scrolling after commit. */
+    if (maximum_scroll > viewport_height) maximum_scroll = viewport_height;
+    size_t desired_frame_count = maximum_scroll > 0
+        ? BROWSER_PROVISIONAL_FRAME_LIMIT : 1u;
+    if (pixels > SIZE_MAX / desired_frame_count
+        || pixels * desired_frame_count > SIZE_MAX / sizeof(uint16_t)) {
+        return false;
+    }
+    const size_t frame_bytes = pixels * sizeof(uint16_t);
+    if (budget_pressure_required(
+            &engine->budget, frame_bytes,
+            BROWSER_PROVISIONAL_FINAL_RESERVE)) {
+        budget_record_pressure(
+            &engine->budget, BUDGET_PRESSURE_SPECULATION, frame_bytes, 0);
+        return false;
+    }
+    browser_engine_reset_provisional_viewport(engine);
+    uint64_t alloc_started_us =
+        tilefinch_platform_monotonic_time_us();
+    engine->provisional_frames = budget_malloc_category(
+        &engine->budget, BUDGET_CATEGORY_RENDER, frame_bytes);
+    uint64_t alloc_finished_us =
+        tilefinch_platform_monotonic_time_us();
+    uint64_t first_alloc_us = alloc_finished_us >= alloc_started_us
+        ? alloc_finished_us - alloc_started_us : 0;
+    candidate->performance.streaming_preview_frame_alloc_us +=
+        first_alloc_us;
+    if (engine->provisional_frames == NULL) return false;
+    engine->provisional_frame_pixels = pixels;
+    engine->provisional_scroll_positions[0] = 0;
+    size_t frame_count = 1;
+
+    size_t capacity = engine->config.tile_capacity;
+    if (capacity > 8) capacity = 8;
+    TileCache preview = {0};
+    bool first_painted = false;
+    uint64_t cache_started_us =
+        tilefinch_platform_monotonic_time_us();
+    if (capacity != 0
+        && browser_engine_init_tile_cache(
+               engine, &preview, layout, capacity)) {
+        uint64_t cache_ready_us =
+            tilefinch_platform_monotonic_time_us();
+        if (cache_ready_us >= cache_started_us) {
+            candidate->performance.streaming_preview_cache_init_us +=
+                cache_ready_us - cache_started_us;
+        }
+        tile_cache_set_fast_text_raster(&preview, true);
+        for (size_t i = 0; i < frame_count; i++) {
+            uint16_t *frame = engine->provisional_frames + i * pixels;
+            uint64_t raster_started_us =
+                tilefinch_platform_monotonic_time_us();
+            bool rendered =
+                tile_cache_set_frame(&preview, frame, pixels)
+                && tile_cache_render_frame(
+                    &preview,
+                    engine->provisional_scroll_positions[i],
+                    (int) width, (int) height, NULL);
+            uint64_t raster_finished_us =
+                tilefinch_platform_monotonic_time_us();
+            if (raster_finished_us >= raster_started_us) {
+                candidate->performance.streaming_preview_raster_us +=
+                    raster_finished_us - raster_started_us;
+            }
+            if (!rendered) {
+                break;
+            }
+            if (i == 0) {
+                /* A structurally nonempty body can still rasterize as one
+                   flat background while its first visible content remains
+                   in a later response chunk. Publishing that frame would
+                   satisfy a timer without giving the user a page. Require a
+                   small, resolution-independent amount of authored visual
+                   contrast and let the streaming parser retry at its next
+                   bounded checkpoint when it is absent. */
+                size_t contrasting = 0;
+                uint16_t background = frame[0];
+                /* Reject a lone border/placeholder row as well as a fully
+                   flat surface. Two scanlines' worth of contrast is still a
+                   tiny resolution-relative threshold for real page text. */
+                const size_t required =
+                    width <= SIZE_MAX / 2u ? width * 2u : 64u;
+                for (size_t pixel = 1;
+                     pixel < pixels && contrasting < required; pixel++) {
+                    if (frame[pixel] != background) contrasting++;
+                }
+                if (contrasting < required) {
+                    candidate->performance
+                        .streaming_preview_empty_raster_skips++;
+                    break;
+                }
+            }
+            __sync_synchronize();
+            engine->provisional_frame_count = i + 1u;
+            if (i == 0) {
+                first_painted = true;
+                engine->provisional_current_frame = 0;
+                engine->provisional_ready = true;
+                BrowserEngineNavigationWork *work =
+                    &engine->navigation_work;
+                work->metrics.provisional_paints++;
+                work->metrics.provisional_frame_count = 1;
+                work->metrics.provisional_bytes =
+                    budget_usable_size(engine->provisional_frames);
+                uint64_t now_us =
+                    tilefinch_platform_monotonic_time_us();
+                work->metrics.provisional_first_present_us =
+                    now_us >= work->started_us
+                        ? now_us - work->started_us : 0;
+                uint64_t present_started_us = now_us;
+                (void) tilefinch_platform_present_rgb565(
+                    frame, width, height, width);
+                uint64_t present_finished_us =
+                    tilefinch_platform_monotonic_time_us();
+                if (present_finished_us >= present_started_us) {
+                    candidate->performance.streaming_preview_present_us +=
+                        present_finished_us - present_started_us;
+                }
+            } else {
+                engine->navigation_work.metrics.provisional_frame_count =
+                    i + 1u;
+            }
+            if (i == 0 && desired_frame_count > 1u) {
+                if (!tilefinch_platform_cooperate(
+                        "provisional-raster", i + 1u)) {
+                    break;
+                }
+                /*
+                 * Never make the useful first viewport wait for the optional
+                 * scroll snapshot. Grow only when the allocator proved cheap
+                 * and the second frame still leaves room for authoritative
+                 * commit state. Slow admission is a direct signal of PSP
+                 * heap pressure/fragmentation and must not create another
+                 * unresponsive interval immediately after first paint.
+                 */
+                size_t grown_bytes = frame_bytes * desired_frame_count;
+                if (first_alloc_us <=
+                        BROWSER_PROVISIONAL_GROW_MAX_ALLOC_US
+                    && !budget_pressure_required(
+                        &engine->budget, grown_bytes - frame_bytes,
+                        BROWSER_PROVISIONAL_FINAL_RESERVE)) {
+                    uint64_t grow_started_us =
+                        tilefinch_platform_monotonic_time_ns()
+                        / UINT64_C(1000);
+                    uint16_t *grown = budget_realloc_category(
+                        &engine->budget, BUDGET_CATEGORY_RENDER,
+                        engine->provisional_frames, grown_bytes);
+                    uint64_t grow_finished_us =
+                        tilefinch_platform_monotonic_time_ns()
+                        / UINT64_C(1000);
+                    if (grow_finished_us >= grow_started_us) {
+                        candidate->performance
+                            .streaming_preview_frame_alloc_us +=
+                            grow_finished_us - grow_started_us;
+                    }
+                    if (grown != NULL) {
+                        engine->provisional_frames = grown;
+                        engine->navigation_work.metrics.provisional_bytes =
+                            budget_usable_size(
+                                engine->provisional_frames);
+                        engine->provisional_scroll_positions[1] =
+                            maximum_scroll;
+                        frame_count = desired_frame_count;
+                    }
+                }
+            } else if (i + 1u < frame_count
+                       && !tilefinch_platform_cooperate(
+                           "provisional-raster", i + 1u)) {
+                break;
+            }
+        }
+        candidate->performance.progressive_decoded_image_builds +=
+            preview.decoded_image_builds;
+        candidate->performance.progressive_scaled_image_builds +=
+            preview.scaled_image_builds;
+    }
+    if (preview.budget != NULL) tile_cache_destroy(&preview);
+    if (!first_painted) browser_engine_reset_provisional_viewport(engine);
+    return first_painted;
+}
+
+static bool browser_engine_paint_progressive_preview(
+    void *opaque, NavigationSession *candidate,
+    const LayoutDocument *layout)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || candidate == NULL
+        || candidate->budget != &engine->budget
+        || engine->config.device.framebuffer_width <= 0
+        || engine->config.device.framebuffer_height <= 0) return false;
+    size_t width = (size_t) engine->config.device.framebuffer_width;
+    size_t height = (size_t) engine->config.device.framebuffer_height;
+    if (width > SIZE_MAX / height
+        || width * height > SIZE_MAX / sizeof(uint16_t)) return false;
+    size_t pixels = width * height;
+    bool asynchronous =
+        engine->navigation_work.status == BROWSER_NAVIGATION_JOB_PENDING;
+    if (asynchronous) {
+        if (layout == NULL) {
+            browser_engine_reset_provisional_viewport(engine);
+            browser_engine_abort_candidate_shell(engine);
+            return true;
+        }
+        return browser_engine_capture_provisional_viewport(
+            engine, candidate, layout, width, height);
+    }
+    if (layout == NULL) {
+        /* A failed cold-start candidate has no incumbent frame to restore.
+           Clear its already-presented preview immediately; the frontend can
+           then overlay the navigation error without retaining dead content. */
+        if (engine->framebuffer != NULL
+            && engine->framebuffer_pixels >= pixels) {
+            for (size_t i = 0; i < pixels; i++)
+                engine->framebuffer[i] = UINT16_C(0xffff);
+            (void) tilefinch_platform_present_rgb565(
+                engine->framebuffer, width, height, width);
+        }
+        browser_engine_abort_candidate_shell(engine);
+        return true;
+    }
+    bool transient_preview =
+        candidate->performance.partial_layouts != 0;
+    if (!transient_preview
+        && engine->config.tile_capacity != 0 && engine->framebuffer != NULL
+        && engine->framebuffer_pixels >= pixels) {
+        browser_engine_abort_candidate_shell(engine);
+        bool painted = browser_engine_init_tile_cache(
+                engine, &engine->candidate_render, layout,
+                engine->config.tile_capacity)
+            && tile_cache_set_frame(
+                &engine->candidate_render, engine->framebuffer,
+                engine->framebuffer_pixels)
+            && tile_cache_render_frame(
+                &engine->candidate_render, 0, (int) width, (int) height,
+                NULL);
+        if (!painted) {
+            browser_engine_abort_candidate_shell(engine);
+            return false;
+        }
+        engine->candidate_render_ready = true;
+        (void) tilefinch_platform_present_rgb565(
+            engine->framebuffer, width, height, width);
+        /* Presentation is the first-paint boundary. Paint-only preparation
+           below must not move this timestamp merely because the browser is
+           not interactive yet. */
+        if (candidate->performance.first_paint_us == 0
+            && candidate->navigation_started_us != 0) {
+            uint64_t now_us = tilefinch_platform_monotonic_time_us();
+            candidate->performance.first_paint_us =
+                now_us >= candidate->navigation_started_us
+                ? now_us - candidate->navigation_started_us : 0;
+        }
+        int prefetch_y = candidate->viewport.css_height
+                         + TILEFINCH_TILE_SIZE - 1;
+        if (prefetch_y < layout->height) {
+            tile_cache_prepare_startup_visuals(
+                &engine->candidate_render, prefetch_y, (int) width,
+                3000, 4);
+        }
+        candidate->performance.progressive_decoded_image_builds +=
+            engine->candidate_render.decoded_image_builds;
+        candidate->performance.progressive_scaled_image_builds +=
+            engine->candidate_render.scaled_image_builds;
+        return true;
+    }
+    if (transient_preview && engine->framebuffer != NULL
+        && engine->framebuffer_pixels >= pixels) {
+        size_t capacity = engine->config.tile_capacity;
+        if (capacity == 0) {
+            capacity = engine->config.device.maximum_tile_capacity;
+        }
+        if (capacity > 8) capacity = 8;
+        TileCache preview = {0};
+        bool painted = capacity != 0
+            && browser_engine_init_tile_cache(
+                   engine, &preview, layout, capacity)
+            && tile_cache_set_frame(
+                   &preview, engine->framebuffer,
+                   engine->framebuffer_pixels)
+            && tile_cache_render_frame(
+                   &preview, 0, (int) width, (int) height, NULL);
+        if (painted) {
+            candidate->performance.progressive_decoded_image_builds +=
+                preview.decoded_image_builds;
+            candidate->performance.progressive_scaled_image_builds +=
+                preview.scaled_image_builds;
+            (void) tilefinch_platform_present_rgb565(
+                engine->framebuffer, width, height, width);
+        }
+        if (preview.budget != NULL) tile_cache_destroy(&preview);
+        return painted;
+    }
+    uint16_t *frame = budget_malloc_category(
+        &engine->budget, BUDGET_CATEGORY_RENDER,
+        pixels * sizeof(*frame));
+    if (frame == NULL) return false;
+    size_t capacity = engine->config.tile_capacity;
+    if (capacity == 0) capacity = engine->config.device.maximum_tile_capacity;
+    if (capacity > 8) capacity = 8;
+    TileCache preview = {0};
+    bool painted = capacity != 0
+        && browser_engine_init_tile_cache(
+               engine, &preview, layout, capacity)
+        && tile_cache_set_frame(&preview, frame, pixels)
+        && tile_cache_render_frame(
+               &preview, 0, (int) width, (int) height, NULL);
+    if (painted) {
+        candidate->performance.progressive_decoded_image_builds +=
+            preview.decoded_image_builds;
+        candidate->performance.progressive_scaled_image_builds +=
+            preview.scaled_image_builds;
+        /* A host lab without a presentation service still has a genuine
+           raster-ready first paint.  PSP and platform-simulator frontends
+           install this service and receive the preview immediately. */
+        (void) tilefinch_platform_present_rgb565(
+            frame, width, height, width);
+    }
+    if (preview.budget != NULL) tile_cache_destroy(&preview);
+    budget_free(&engine->budget, frame);
+    return painted;
+}
+
+static bool browser_engine_configure_navigation(BrowserEngine *engine)
+{
+    NavigationSession *navigation = &engine->navigation;
+    navigation->declared_css_width = engine->config.declared_css_width;
+    navigation->declared_css_height = engine->config.declared_css_height;
+    navigation_attach_browser_session(navigation, &engine->session);
+    navigation_set_deferred_image_ready_hook(
+        navigation, browser_engine_deferred_reader_images_ready, engine);
+    if (!navigation_set_replacement_mode(
+            navigation, engine->config.navigation_replacement_mode)
+        || !navigation_set_replacement_hooks(
+            navigation, browser_engine_freeze_replacement_frame,
+            browser_engine_replacement_outcome, engine)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "replacement-policy",
+            "could not apply navigation replacement policy");
+    }
+    /* Retain half a viewport below the first frame. This is enough to make
+       provisional page-down useful while keeping the speculative layout's
+       style and intrinsic-size walks local to pixels it can soon present. */
+    if (!navigation_set_progressive_preview_lookahead(navigation, 50u)
+        || !navigation_set_progressive_paint_hook(
+            navigation,
+            engine->config.progressive_first_paint
+                ? browser_engine_paint_progressive_preview : NULL,
+            engine->config.progressive_first_paint ? engine : NULL)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "progressive-paint-policy",
+            "could not apply progressive first-paint policy");
+    }
+    navigation_set_progressive_paint_preserves_incumbent(
+        navigation, engine->config.progressive_first_paint);
+    if (!navigation_set_script_execution_policy(
+            navigation, &engine->config.javascript.execution_policy)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_SCRIPT,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "script-policy",
+            "could not apply JavaScript execution policy");
+    }
+    if (engine->config.javascript.enabled) {
+        navigation_enable_scripts(
+            navigation, engine->config.javascript.heap_limit,
+            engine->config.javascript.runtime_timeout_ms);
+    }
+    if (engine->config.javascript.document_scripts_enabled) {
+        navigation_enable_document_scripts(
+            navigation, engine->config.javascript.maximum_scripts,
+            engine->config.javascript.maximum_total_bytes,
+            engine->config.javascript.maximum_file_bytes,
+            engine->config.javascript.network_timeout_ms);
+    }
+    if (engine->config.resources.enabled) {
+        const BrowserResourceConfig *resources = &engine->config.resources;
+        navigation_enable_external_resources(
+            navigation, resources->maximum_stylesheets,
+            resources->maximum_stylesheet_bytes,
+            resources->maximum_stylesheet_file_bytes,
+            resources->maximum_images, resources->maximum_image_bytes,
+            resources->maximum_image_file_bytes,
+            resources->maximum_decoded_image_bytes, resources->timeout_ms);
+        navigation->maximum_publication_work_units =
+            resources->maximum_publication_work_units;
+        if (resources->web_fonts_enabled) {
+            navigation_enable_web_fonts(
+                navigation, resources->maximum_font_attempts,
+                resources->maximum_font_bytes,
+                resources->maximum_font_file_bytes,
+                resources->maximum_font_face_backend_bytes,
+                resources->timeout_ms);
+        }
+    }
+    return true;
+}
+
+BrowserEngine *browser_engine_create(const BrowserConfig *config,
+                                     char *error, size_t error_capacity)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t create_started_us = tilefinch_platform_monotonic_time_us();
+    BrowserEngineCreationMetrics create_metrics = {0};
+#define BROWSER_ENGINE_CREATE_MARK(member_name) do { \
+    uint64_t create_now_us = tilefinch_platform_monotonic_time_us(); \
+    create_metrics.member_name = create_now_us - create_started_us; \
+} while (0)
+#else
+#define BROWSER_ENGINE_CREATE_MARK(member_name) do {} while (0)
+#endif
+    if (!browser_config_validate(config, error, error_capacity)) return NULL;
+    if (active_engine != NULL) {
+        copy_error(error, error_capacity,
+                   "another BrowserEngine is already active");
+        return NULL;
+    }
+    BrowserEngine *engine = calloc(1, sizeof(*engine));
+    if (engine == NULL) {
+        copy_error(error, error_capacity,
+                   "could not allocate the fixed browser control block");
+        return NULL;
+    }
+    engine->config = *config;
+    engine->state = BROWSER_ENGINE_ACTIVE;
+    tilefinch_diagnostics_init(
+        &engine->diagnostics, config->diagnostics.callback,
+        config->diagnostics.opaque, config->diagnostics.minimum_severity);
+    clear_error(engine);
+    budget_init(&engine->budget, config->memory_limit);
+    if (!budget_install_lexbor(&engine->budget)) {
+        set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                       TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED,
+                       "lexbor-owner",
+                       "another live Lexbor allocation owner is installed");
+        goto failed;
+    }
+    active_engine = engine;
+    BROWSER_ENGINE_CREATE_MARK(control_ready_us);
+
+    if (!browser_session_init(&engine->session, &engine->budget,
+                              config->session_cache_limit)) {
+        set_error_code(engine, TILEFINCH_SUBSYSTEM_STORAGE,
+                       TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED,
+                       "session-init",
+                       "browser session initialization failed");
+        goto failed;
+    }
+    engine->session_ready = true;
+    BROWSER_ENGINE_CREATE_MARK(session_ready_us);
+    engine->content_blocker = content_blocker_create(&engine->budget);
+    if (engine->content_blocker == NULL) {
+        set_error_code(engine, TILEFINCH_SUBSYSTEM_STORAGE,
+                       TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED,
+                       "content-blocker-init",
+                       "content blocker control allocation failed");
+        goto failed;
+    }
+    engine->session.content_blocker = engine->content_blocker;
+    BROWSER_ENGINE_CREATE_MARK(blocker_ready_us);
+    if (!navigation_init(&engine->navigation, &engine->budget,
+                         config->history_capacity)) {
+        set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                       TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED,
+                       "navigation-init", "navigation initialization failed");
+        goto failed;
+    }
+    engine->navigation_ready = true;
+    if (!browser_engine_configure_navigation(engine)) goto failed;
+    BROWSER_ENGINE_CREATE_MARK(navigation_ready_us);
+
+    if (config->fonts.enabled && !config->fonts.staged_loading) {
+        const BrowserFontConfig *fonts = &config->fonts;
+        if (!font_set_load(
+                &engine->fonts, &engine->budget, fonts->sans_path,
+                fonts->serif_path, fonts->sans_italic_path,
+                fonts->sans_bold_path, fonts->serif_bold_path,
+                fonts->metric_sans_path, fonts->metric_sans_bold_path,
+                fonts->maximum_total_bytes)) {
+            set_error_code(engine, TILEFINCH_SUBSYSTEM_RENDER,
+                           TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED,
+                           "font-load", "bounded font loading failed");
+            goto failed;
+        }
+        engine->fonts_ready = true;
+    }
+    BROWSER_ENGINE_CREATE_MARK(fonts_ready_us);
+
+    if (config->tile_capacity != 0) {
+        engine->framebuffer_pixels =
+            (size_t) config->device.framebuffer_width
+            * (size_t) config->device.framebuffer_height;
+        engine->framebuffer = budget_calloc_category(
+            &engine->budget, BUDGET_CATEGORY_RENDER,
+            engine->framebuffer_pixels, sizeof(*engine->framebuffer));
+        if (engine->framebuffer == NULL) {
+            set_error_code(engine, TILEFINCH_SUBSYSTEM_RENDER,
+                           TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED,
+                           "framebuffer-allocation",
+                           "bounded framebuffer allocation failed");
+            goto failed;
+        }
+    }
+    BROWSER_ENGINE_CREATE_MARK(framebuffer_ready_us);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    engine->creation_metrics = create_metrics;
+#endif
+    (void) emit_diagnostic(
+        engine, TILEFINCH_DIAGNOSTIC_INFO,
+        TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
+        "engine-created", config->device.name, config->memory_limit,
+        engine->framebuffer_pixels * sizeof(*engine->framebuffer));
+    copy_error(error, error_capacity, "");
+#undef BROWSER_ENGINE_CREATE_MARK
+    return engine;
+
+failed: {
+        char retained[sizeof(engine->last_error)];
+        snprintf(retained, sizeof(retained), "%s", engine->last_error);
+        if (browser_engine_shutdown(engine)) free(engine);
+        copy_error(error, error_capacity, retained);
+        return NULL;
+    }
+}
+
+bool browser_engine_creation_metrics(
+    const BrowserEngine *engine, BrowserEngineCreationMetrics *metrics)
+{
+    if (metrics != NULL) *metrics = (BrowserEngineCreationMetrics) {0};
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (engine == NULL || metrics == NULL) return false;
+    *metrics = engine->creation_metrics;
+    return true;
+#else
+    (void) engine;
+    return false;
+#endif
+}
+
+bool browser_engine_set_javascript_enabled(
+    BrowserEngine *engine, bool enabled)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || browser_engine_navigation_pending(engine)) return false;
+    engine->config.javascript.enabled = enabled;
+    engine->config.javascript.document_scripts_enabled = enabled;
+    navigation_enable_scripts(
+        &engine->navigation,
+        enabled ? engine->config.javascript.heap_limit : 0u,
+        enabled ? engine->config.javascript.runtime_timeout_ms : 0u);
+    navigation_enable_document_scripts(
+        &engine->navigation,
+        enabled ? engine->config.javascript.maximum_scripts : 0u,
+        enabled ? engine->config.javascript.maximum_total_bytes : 0u,
+        enabled ? engine->config.javascript.maximum_file_bytes : 0u,
+        enabled ? engine->config.javascript.network_timeout_ms : 0);
+    return true;
+}
+
+bool browser_engine_shutdown(BrowserEngine *engine)
+{
+    if (engine == NULL) return false;
+    if (engine->state == BROWSER_ENGINE_SHUTDOWN) {
+        if (active_engine == engine) {
+            if (!budget_uninstall_lexbor(&engine->budget)) return false;
+            active_engine = NULL;
+        }
+        return engine->budget.current == 0
+            && budget_active_allocations(&engine->budget, NULL) == 0;
+    }
+    browser_engine_cancel_navigation(engine, "browser engine shutdown");
+    /* A page cancellation only invalidates the JPEG completion token; it
+       deliberately never waits on entropy decoding. Engine teardown is the
+       ownership boundary that must join the worker before destroying the
+       page Budget and its retained encoded body. */
+    if (!images_decode_worker_shutdown(&engine->budget)) {
+        set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                       TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED,
+                       "image-worker-shutdown",
+                       "JPEG worker did not quiesce before teardown");
+        return false;
+    }
+    browser_engine_find_clear(engine);
+    if (engine->navigation_ready)
+        document_backing_uninstall(&engine->navigation);
+    document_backing_clear(&engine->backing);
+    browser_engine_reset_provisional_viewport(engine);
+    browser_engine_abort_candidate_shell(engine);
+    browser_engine_reset_shell(engine);
+    if (engine->navigation_ready) {
+        (void) navigation_set_candidate_commit_hooks(
+            &engine->navigation, NULL, NULL, NULL, NULL);
+        (void) navigation_set_replacement_hooks(
+            &engine->navigation, NULL, NULL, NULL);
+        navigation_destroy(&engine->navigation);
+    }
+    engine->navigation_ready = false;
+    browser_engine_discard_staged_fonts(engine);
+    if (font_set_loaded_bytes(&engine->fonts) != 0)
+        font_set_destroy(&engine->fonts);
+    engine->fonts_ready = false;
+    if (engine->session_ready) engine->session.content_blocker = NULL;
+    content_blocker_destroy(engine->content_blocker);
+    engine->content_blocker = NULL;
+    if (engine->session_ready) browser_session_destroy(&engine->session);
+    engine->session_ready = false;
+    budget_free(&engine->budget, engine->framebuffer);
+    engine->framebuffer = NULL;
+    engine->framebuffer_pixels = 0;
+    engine->state = BROWSER_ENGINE_SHUTDOWN;
+    bool clean = engine->budget.current == 0
+        && budget_active_allocations(&engine->budget, NULL) == 0
+        && budget_categories_reconcile(&engine->budget);
+    if (!clean) {
+        set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                       TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED,
+                       "engine-shutdown",
+                       "browser engine teardown retained memory");
+    } else {
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_INFO,
+            TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
+            "engine-shutdown", "clean bounded teardown", 0, 0);
+    }
+    if (active_engine == engine && clean) {
+        clean = budget_uninstall_lexbor(&engine->budget);
+        if (clean) active_engine = NULL;
+    }
+    return clean;
+}
+
+void browser_engine_destroy(BrowserEngine *engine)
+{
+    if (engine == NULL) return;
+    if (browser_engine_shutdown(engine)) free(engine);
+}
+
+const BrowserConfig *browser_engine_config(const BrowserEngine *engine)
+{
+    return engine == NULL ? NULL : &engine->config;
+}
+
+const char *browser_engine_last_error(const BrowserEngine *engine)
+{
+    return engine == NULL ? "browser engine is null" : engine->last_error;
+}
+
+long browser_engine_last_tls_verify_result(const BrowserEngine *engine)
+{
+    return engine == NULL || !engine->navigation_ready
+        ? 0 : engine->navigation.last_tls_verify_result;
+}
+
+bool browser_engine_last_tls_verify_result_available(
+    const BrowserEngine *engine)
+{
+    return engine != NULL && engine->navigation_ready
+        && engine->navigation.last_tls_verify_result_available;
+}
+
+bool browser_engine_last_tls_verification_failed(
+    const BrowserEngine *engine)
+{
+    return engine != NULL && engine->navigation_ready
+        && engine->navigation.last_tls_verification_failed;
+}
+
+TilefinchDiagnosticCode browser_engine_last_diagnostic_code(
+    const BrowserEngine *engine)
+{
+    return engine == NULL ? TILEFINCH_DIAGNOSTIC_INVALID_INPUT
+                          : engine->last_diagnostic_code;
+}
+
+bool browser_engine_metrics(const BrowserEngine *engine,
+                            BrowserEngineMetrics *metrics)
+{
+    if (engine == NULL || metrics == NULL) return false;
+    memset(metrics, 0, sizeof(*metrics));
+    metrics->state = engine->state;
+    metrics->control_bytes = sizeof(*engine);
+    metrics->framebuffer_bytes = engine->framebuffer_pixels
+                                 * sizeof(*engine->framebuffer);
+    metrics->non_page_memory_reserve =
+        engine->config.non_page_memory_reserve;
+    metrics->budget_limit = engine->budget.limit;
+    metrics->budget_current = engine->budget.current;
+    metrics->budget_peak = engine->budget.peak;
+    metrics->budget_external_reserved = engine->budget.external_reserved;
+    metrics->budget_external_reserved_peak =
+        engine->budget.external_reserved_peak;
+    metrics->session_inline_accounting_bytes =
+        engine->session.accounting_bytes;
+    metrics->budget_active_allocations = budget_active_allocations(
+        &engine->budget, &metrics->budget_largest_allocation);
+    metrics->allocation_failures = engine->budget.failure_count;
+    metrics->diagnostics_emitted = engine->diagnostics.emitted;
+    metrics->diagnostics_filtered = engine->diagnostics.filtered;
+    metrics->last_diagnostic_subsystem = engine->last_diagnostic_subsystem;
+    metrics->last_diagnostic_code = engine->last_diagnostic_code;
+    metrics->fonts_ready = engine->fonts_ready;
+    metrics->controller_ready = engine->controller_ready;
+    metrics->render_ready = engine->render_ready;
+    metrics->backing_kind = document_backing_kind(&engine->backing);
+    metrics->section_count = document_backing_section_count(&engine->backing);
+    metrics->current_section = document_backing_current_section(
+        &engine->backing);
+    if (engine->navigation_ready) {
+        const NavigationSession *navigation = &engine->navigation;
+        metrics->page_loaded = navigation->page.loaded;
+        metrics->loads_started = navigation->loads_started;
+        metrics->loads_committed = navigation->loads_committed;
+        metrics->loads_cancelled = navigation->loads_cancelled;
+        metrics->pages_destroyed = navigation->page_destroys;
+        metrics->navigation = navigation->performance;
+    }
+    if (engine->controller_ready) {
+        metrics->controller_focus_moves = engine->controller.focus_moves;
+        metrics->controller_activations = engine->controller.activations;
+        metrics->controller_text_edits = engine->controller.text_edits;
+    }
+    if (engine->render_ready) {
+        metrics->rendered_frames = engine->render.frames_rendered;
+        metrics->unchanged_runtime_frames_suppressed =
+            engine->unchanged_runtime_frames_suppressed;
+        metrics->maximum_render_us = engine->render.max_frame_us;
+        metrics->idle_jobs_scheduled = engine->render.idle_jobs_scheduled;
+        metrics->idle_jobs_completed = engine->render.idle_jobs_completed;
+        metrics->idle_jobs_cancelled = engine->render.idle_jobs_cancelled;
+        metrics->idle_slices = engine->render.idle_slices;
+        metrics->idle_slice_overruns = engine->render.idle_slice_overruns;
+        metrics->idle_image_admission_skips =
+            engine->render.idle_image_admission_skips;
+        metrics->idle_glyphs_prewarmed =
+            engine->render.idle_glyphs_prewarmed;
+        metrics->idle_glyph_cache_misses =
+            engine->render.idle_glyph_cache_misses;
+        metrics->idle_work_us = engine->render.idle_us;
+        metrics->maximum_idle_slice_us = engine->render.max_idle_slice_us;
+        metrics->maximum_idle_unit_us = engine->render.max_idle_unit_us;
+        metrics->startup_visual_slices =
+            engine->render.startup_visual_slices;
+        metrics->startup_visual_us = engine->render.startup_visual_us;
+        metrics->maximum_startup_visual_slice_us =
+            engine->render.max_startup_visual_slice_us;
+        metrics->maximum_startup_visual_unit_us =
+            engine->render.max_startup_visual_unit_us;
+    }
+    return true;
+}
+
+bool browser_engine_content_blocker_configure(
+    BrowserEngine *engine, ContentBlockerMode mode,
+    const char *custom_path)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && content_blocker_configure(
+               engine->content_blocker, mode, custom_path);
+}
+
+bool browser_engine_content_blocker_set_allowed_sites(
+    BrowserEngine *engine, const char *const *sites, size_t count)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && content_blocker_set_allowed_sites(
+               engine->content_blocker, sites, count);
+}
+
+bool browser_engine_content_blocker_metrics(
+    const BrowserEngine *engine, ContentBlockerMetrics *metrics)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && content_blocker_metrics(engine->content_blocker, metrics);
+}
+
+bool browser_engine_refresh_shell(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "shell-refresh",
+            "no committed page is available");
+    }
+    lxb_dom_node_t *focused_node = engine->controller_ready
+        ? controller_focused_node(&engine->controller) : NULL;
+    browser_engine_reset_shell(engine);
+    if (!controller_init(&engine->controller, &engine->navigation))
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, "controller-init",
+            "controller initialization failed");
+    engine->controller_ready = true;
+    if (focused_node != NULL)
+        (void) controller_restore_focus_node(
+            &engine->controller, focused_node);
+    return browser_engine_initialize_render_shell(
+        engine, "render-shell-init",
+        "render shell initialization failed");
+}
+
+bool browser_engine_refresh_render_shell(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded
+        || engine->config.tile_capacity == 0) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "render-shell-refresh",
+            "no engine-owned render shell can be refreshed");
+    }
+    browser_engine_cancel_idle_work(engine);
+    browser_engine_reset_render_shell(engine);
+    return browser_engine_initialize_render_shell(
+        engine, "render-shell-refresh", "render shell refresh failed");
+}
+
+bool browser_engine_apply_layout_damage(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded
+        || !engine->render_ready) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "render-layout-damage",
+            "render shell is not ready for layout damage");
+    }
+    if (engine->render_relayout_generation
+        == engine->navigation.incremental_relayouts) {
+        clear_error(engine);
+        return true;
+    }
+    browser_engine_cancel_idle_work(engine);
+    if (engine->navigation.canvas_paint_damage_pending) {
+        const ImageResources *images = &engine->navigation.page.images;
+        for (size_t i = 0; i < images->count; i++) {
+            const ImageResource *image = &images->items[i];
+            if (image->is_canvas) {
+                tile_cache_invalidate_image_identity(
+                    &engine->render,
+                    image_resource_backing_identity(image));
+            }
+        }
+        if (!tile_cache_sync_canvas_paint(
+                &engine->render,
+                engine->navigation.relayout_damage_left,
+                engine->navigation.relayout_damage_top,
+                engine->navigation.relayout_damage_right,
+                engine->navigation.relayout_damage_bottom)) {
+            return set_error_code(
+                engine, TILEFINCH_SUBSYSTEM_RENDER,
+                TILEFINCH_DIAGNOSTIC_RENDER_FAILED,
+                "render-canvas-damage",
+                "render shell could not apply canvas damage");
+        }
+        engine->navigation.canvas_paint_damage_pending = false;
+        engine->render_relayout_generation =
+            engine->navigation.incremental_relayouts;
+        clear_error(engine);
+        return true;
+    }
+    if (!tile_cache_replace_layout_damage(
+            &engine->render, &engine->navigation.page.layout,
+            engine->navigation.relayout_damage_left,
+            engine->navigation.relayout_damage_top,
+            engine->navigation.relayout_damage_right,
+            engine->navigation.relayout_damage_bottom)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "render-layout-damage",
+            "render shell could not apply layout damage");
+    }
+    engine->render_relayout_generation =
+        engine->navigation.incremental_relayouts;
+    engine->render_focus_paint_generation =
+        engine->navigation.focus_paint_generation;
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_set_forced_dark(BrowserEngine *engine, bool enabled)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) {
+        return false;
+    }
+    if (engine->forced_dark == enabled) return true;
+    engine->forced_dark = enabled;
+    /*
+     * Provisional frames are immutable snapshots. Retaining one across an
+     * appearance change would briefly reintroduce the old palette during a
+     * pending navigation, so discard it rather than post-processing pixels
+     * whose image provenance has already been lost.
+     */
+    browser_engine_reset_provisional_viewport(engine);
+    if (engine->render_ready) {
+        tile_cache_set_forced_dark(&engine->render, enabled);
+    }
+    if (engine->candidate_render_ready) {
+        tile_cache_set_forced_dark(&engine->candidate_render, enabled);
+    }
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_optional_glyphs_updated(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE)
+        return false;
+    browser_engine_reset_provisional_viewport(engine);
+    if (engine->render_ready)
+        tile_cache_invalidate_glyphs(&engine->render);
+    if (engine->candidate_render_ready)
+        tile_cache_invalidate_glyphs(&engine->candidate_render);
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE)
+        return false;
+    browser_engine_reset_provisional_viewport(engine);
+    if (engine->render_ready)
+        tile_cache_repaint_glyphs(&engine->render);
+    if (engine->candidate_render_ready)
+        tile_cache_repaint_glyphs(&engine->candidate_render);
+    clear_error(engine);
+    return true;
+}
+
+uint16_t browser_engine_glyph_script_mask(const BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        ? 0 : engine->navigation.page.document.glyph_script_mask;
+}
+
+bool browser_engine_set_youtube_compact_results(
+    BrowserEngine *engine, bool compact)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) {
+        return false;
+    }
+    engine->youtube_compact_results = compact;
+    clear_error(engine);
+    return true;
+}
+
+static bool browser_engine_apply_focus_paint(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->render_ready
+        || engine->render_focus_paint_generation
+               == engine->navigation.focus_paint_generation) return true;
+    if (!engine->navigation.focus_paint_damage_valid
+        || !tile_cache_sync_layout_paint(
+            &engine->render,
+            engine->navigation.focus_paint_damage_left,
+            engine->navigation.focus_paint_damage_top,
+            engine->navigation.focus_paint_damage_right,
+            engine->navigation.focus_paint_damage_bottom)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "render-focus-paint",
+            "render shell could not apply focus paint damage");
+    }
+    engine->render_focus_paint_generation =
+        engine->navigation.focus_paint_generation;
+    return true;
+}
+
+bool browser_engine_bind_document_backing(BrowserEngine *engine,
+                                          const DocumentBacking *backing)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || !document_backing_valid(backing)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_SECTIONS,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "backing-bind",
+            "invalid document backing");
+    }
+    if (backing->kind == DOCUMENT_BACKING_FULL
+        && (!engine->navigation.page.loaded
+            || backing->full_document != &engine->navigation.page.document)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_SECTIONS,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "backing-bind",
+            "full backing must reference the committed document");
+    }
+    DocumentBacking previous = engine->backing;
+    engine->backing = *backing;
+    if (!document_backing_install(&engine->backing, &engine->navigation)) {
+        engine->backing = previous;
+        if (document_backing_valid(&engine->backing))
+            (void) document_backing_install(
+                &engine->backing, &engine->navigation);
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_SECTIONS,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "backing-bind",
+            "document backing installation failed");
+    }
+    clear_error(engine);
+    return true;
+}
+
+static bool browser_engine_bind_current_full_document(BrowserEngine *engine)
+{
+    DocumentBacking full;
+    return document_backing_init_full(
+               &full, &engine->navigation.page.document)
+        && browser_engine_bind_document_backing(engine, &full);
+}
+
+static void browser_engine_navigation_restore_history(
+    BrowserEngine *engine, BrowserEngineNavigationWork *work)
+{
+    if (engine == NULL || work == NULL || !work->history_move
+        || engine->navigation.history_count == 0
+        || engine->navigation.history_index == work->previous_history_index) {
+        return;
+    }
+    const NavigationEntry *ignored = NULL;
+    (void) (work->history_forward
+        ? navigation_back(&engine->navigation, &ignored)
+        : navigation_forward(&engine->navigation, &ignored));
+}
+
+static lxb_dom_node_t *browser_engine_semantic_focus(
+    const BrowserEngine *engine, int kind, size_t ordinal)
+{
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    if (kind == CONTROLLER_FOCUS_CONTROL) {
+        return ordinal < layout->control_count
+            ? layout->controls[ordinal].node : NULL;
+    }
+    if (kind != CONTROLLER_FOCUS_LINK || layout->link_count == 0) return NULL;
+    size_t i = 0;
+    while (ordinal != 0 && ++i < layout->link_count) {
+        if (layout->links[i].node != layout->links[i - 1u].node) ordinal--;
+    }
+    return ordinal == 0 ? layout->links[i].node : NULL;
+}
+
+static size_t browser_engine_focus_ordinal(const BrowserEngine *engine)
+{
+    int kind = engine->controller.focus_kind;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    size_t raw = engine->controller.focus_index;
+    if (kind != CONTROLLER_FOCUS_LINK || raw >= layout->link_count) return raw;
+    size_t ordinal = 0;
+    for (size_t i = 1; i <= raw; i++) {
+        if (layout->links[i].node != layout->links[i - 1u].node) ordinal++;
+    }
+    return ordinal;
+}
+
+static void browser_engine_navigation_restore_view(
+    BrowserEngine *engine, const BrowserEngineNavigationWork *work)
+{
+    if (engine == NULL || work == NULL || !work->history_move) return;
+    lxb_dom_node_t *focus = browser_engine_semantic_focus(
+        engine, work->restore_focus_kind, work->restore_focus_index);
+    if (focus != NULL) (void) controller_focus_node(&engine->controller, focus);
+    /* Focus notifications may relayout or reveal. History owns the exact
+       viewport, so apply its saved position after those side effects. */
+    (void) navigation_set_scroll(
+        &engine->navigation, work->restore_scroll_y);
+}
+
+static NavigationEntry *browser_engine_restorable_entry(BrowserEngine *engine)
+{
+    NavigationEntry *entry = engine != NULL
+        && engine->navigation.history_count != 0
+        && engine->navigation.history_index < engine->navigation.history_count
+        ? &engine->navigation.history[engine->navigation.history_index]
+        : NULL;
+    if (entry == NULL
+        || !browser_engine_history_url_matches_document(
+               entry->url, engine->navigation.page.document_url)) {
+        /* A redirected document does not own the traversed entry's saved
+           controls or focus. Apply this also to ordinary input completion. */
+        return NULL;
+    }
+    return entry;
+}
+
+static void browser_engine_store_current_focus(BrowserEngine *engine)
+{
+    NavigationEntry *entry = browser_engine_restorable_entry(engine);
+    if (entry == NULL) return;
+    entry->focus_kind = (int) engine->controller.focus_kind;
+    entry->focus_index = browser_engine_focus_ordinal(engine);
+}
+
+static void browser_engine_store_current_controls(BrowserEngine *engine)
+{
+    NavigationEntry *entry = browser_engine_restorable_entry(engine);
+    if (entry == NULL) return;
+    entry->control_count = 0u;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    for (size_t index = 0;
+         index < layout->control_count
+         && entry->control_count < NAVIGATION_HISTORY_CONTROL_LIMIT;
+         index++) {
+        lxb_dom_node_t *node = layout->controls[index].node;
+        size_t type_length = 0u;
+        const char *type = node == NULL ? NULL
+            : document_attribute(node, "type", &type_length);
+        if (type != NULL
+            && ((type_length == 8u
+                 && strncasecmp(type, "password", 8u) == 0)
+                || (type_length == 4u
+                    && strncasecmp(type, "file", 4u) == 0))) {
+            continue;
+        }
+        size_t value_length = 0u;
+        const char *value = node == NULL ? NULL
+            : document_control_value(node, &value_length);
+        if (value == NULL || value_length >= 128u || index > UINT16_MAX)
+            continue;
+        NavigationHistoryControl *saved =
+            &entry->controls[entry->control_count++];
+        saved->control_index = (uint16_t) index;
+        saved->value_length = (uint16_t) value_length;
+        if (value_length != 0u)
+            memcpy(saved->value, value, value_length);
+        saved->value[value_length] = '\0';
+    }
+}
+
+static void browser_engine_restore_controls(
+    NavigationSession *navigation,
+    const NavigationHistoryControl *controls, size_t count)
+{
+    if (navigation == NULL || controls == NULL) return;
+    if (count > NAVIGATION_HISTORY_CONTROL_LIMIT)
+        count = NAVIGATION_HISTORY_CONTROL_LIMIT;
+    for (size_t at = 0; at < count; at++) {
+        const NavigationHistoryControl *saved = &controls[at];
+        if (saved->control_index >= navigation->page.layout.control_count)
+            continue;
+        lxb_dom_node_t *node = navigation->page.layout.controls[
+            saved->control_index].node;
+        if (node != NULL) {
+            (void) document_control_value_set(
+                &navigation->page.document, node, saved->value,
+                saved->value_length);
+        }
+    }
+}
+
+static bool browser_engine_settle_same_document_events(
+    BrowserEngine *engine)
+{
+    if (engine != NULL
+        && navigation_settle_same_document_events(&engine->navigation)) {
+        return true;
+    }
+    /* A destructive author mutation whose replacement layout was refused
+       retires the page graph. Drop tile/controller state immediately so no
+       frontend call can observe its borrowed pointers after this boundary. */
+    browser_engine_reset_shell(engine);
+    return false;
+}
+
+static bool browser_engine_commit_same_document_action(
+    BrowserEngine *engine, const char *url)
+{
+    /* Finish earlier input before publishing the native history entry. */
+    if (!browser_engine_finish_input(engine, true)) return false;
+    if (!navigation_commit_same_document_url(&engine->navigation, url)) {
+        return false;
+    }
+    /* hashchange has now observed the new URL, so native history is
+       authoritative even if its bounded transactional relayout is refused.
+       Settle successful mutations before resolving the fragment against the
+       retained layout and before publishing paint damage. */
+    if (!browser_engine_settle_same_document_events(engine)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_RENDER_FAILED,
+            "same-document-settle",
+            "same-document event layout could not be settled");
+    }
+    if (!navigation_scroll_to_fragment(&engine->navigation, url)) return false;
+    /* This entry is already authoritative. Retain its logical focus even if
+       the following render-damage publication is refused. */
+    browser_engine_store_current_focus(engine);
+    if (!browser_engine_finish_input(engine, true)) return false;
+    clear_error(engine);
+    return true;
+}
+
+static void browser_engine_rollback_same_document_cursor(
+    BrowserEngine *engine, bool forward)
+{
+    /* Used only when restore preflight fails before popstate/hashchange is
+       dispatched. Once page script observes a history move, issuing inverse
+       callbacks cannot reconstruct its state (or pruned forward entries). */
+    const NavigationEntry *ignored = NULL;
+    (void) (forward ? navigation_back(&engine->navigation, &ignored)
+                    : navigation_forward(&engine->navigation, &ignored));
+}
+
+static lxb_dom_node_t *browser_engine_attribute_owner(
+    lxb_dom_node_t *node, const lxb_char_t *name, size_t name_length)
+{
+    /* Inline layout can associate a link region with the nested image/span
+       that produced its box rather than with the authored anchor. Walk only
+       the small inline ancestry needed to recover attributes on that anchor;
+       never turn autofocus/provider inspection into a document traversal. */
+    for (unsigned depth = 0; node != NULL && depth < 8u;
+         depth++, node = node->parent) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node), name, name_length)) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static lxb_dom_node_t *browser_engine_autofocus_target(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL) return NULL;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    for (size_t at = 0; at < layout->link_count; at++) {
+        lxb_dom_node_t *node = layout->links[at].node;
+        lxb_dom_node_t *owner = browser_engine_attribute_owner(
+            node, (const lxb_char_t *) "autofocus", 9u);
+        if (owner != NULL) return owner;
+    }
+    for (size_t at = 0; at < layout->control_count; at++) {
+        lxb_dom_node_t *node = layout->controls[at].node;
+        lxb_dom_node_t *owner = browser_engine_attribute_owner(
+            node, (const lxb_char_t *) "autofocus", 9u);
+        if (owner != NULL) return owner;
+    }
+    return NULL;
+}
+
+static bool browser_engine_apply_autofocus(BrowserEngine *engine)
+{
+    lxb_dom_node_t *target = browser_engine_autofocus_target(engine);
+    if (target == NULL) return false;
+    return controller_focus_node(&engine->controller, target);
+}
+
+static void browser_engine_apply_or_defer_autofocus(BrowserEngine *engine)
+{
+    lxb_dom_node_t *target = browser_engine_autofocus_target(engine);
+    if (target != NULL)
+        (void) controller_focus_node(&engine->controller, target);
+    /* The commit layout can precede the first bounded font/resource relayout.
+       Keep one obligation through idle settling even when the initial target
+       is not represented by a focus region yet. This is not standing work:
+       the retry clears itself once the first settled layout has been
+       inspected. */
+    engine->autofocus_pending =
+        engine->navigation.page.document.autofocus_attribute_present;
+}
+
+static void browser_engine_apply_initial_navigation_view(
+    BrowserEngine *engine, bool allow_autofocus)
+{
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    if (entry != NULL && strchr(entry->url, '#') != NULL) {
+        /* A cross-document fragment owns the initial viewport just as a
+           same-document fragment does. Do not let deferred autofocus on a
+           header control scroll it back to the top after resources settle.
+           History restoration and explicit preview scrolling are handled
+           by the caller and retain their existing precedence. */
+        engine->autofocus_pending = false;
+        (void) navigation_scroll_to_fragment(&engine->navigation, entry->url);
+    } else if (allow_autofocus) {
+        browser_engine_apply_or_defer_autofocus(engine);
+    }
+}
+
+static bool browser_engine_retry_deferred_autofocus(
+    BrowserEngine *engine, bool layout_still_settling)
+{
+    if (engine == NULL || !engine->autofocus_pending
+        || browser_engine_navigation_pending(engine)) return false;
+    lxb_dom_node_t *target = browser_engine_autofocus_target(engine);
+    if (target == NULL) {
+        if (!layout_still_settling)
+            engine->autofocus_pending = false;
+        return false;
+    }
+    if (!controller_focus_node(&engine->controller, target)) return false;
+    engine->autofocus_pending = false;
+    return true;
+}
+
+static void browser_engine_census_page_fonts(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->navigation.page.loaded) return;
+    const char *document_url =
+        navigation_active_document_url(&engine->navigation);
+    if (document_url != NULL
+        && site_adapter_handles_navigation("GET", document_url)
+        && !site_adapter_navigation_requires_stable_typography(
+               "GET", document_url)) {
+        /* Provider entry surfaces intentionally stay on the baseline pair:
+           the search control becomes usable immediately and no idle-time
+           face arrival can visibly move it underneath the user. */
+        return;
+    }
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    FontSetFaceMask requested = 0;
+    for (size_t at = 0; at < layout->count; at++) {
+        const DrawCommand *command = &layout->commands[at];
+        if (command->type != DRAW_TEXT) continue;
+        FontFamily family = draw_command_font_family(command);
+        bool serif = family == FONT_SERIF;
+        if (serif) requested |= FONT_SET_FACE_SERIF;
+        if (draw_command_font_italic(command) && !serif)
+            requested |= FONT_SET_FACE_SANS_ITALIC;
+        if (draw_command_font_weight_code(command) >= 65u) {
+            requested |= serif
+                ? FONT_SET_FACE_SERIF_BOLD
+                : (FontSetFaceMask) (FONT_SET_FACE_SANS_BOLD
+                                     | FONT_SET_FACE_METRIC_SANS_BOLD);
+        }
+    }
+    engine->font_requested_faces |= requested;
+}
+
+static void browser_engine_copy_adapter_metrics(
+    BrowserNavigationJobMetrics *metrics, const SiteAdapterLoadMetrics *adapter)
+{
+    metrics->completion_per_mille =
+        adapter->completion_per_mille;
+    metrics->load.pump_calls = adapter->network_pumps;
+    metrics->load.quota_yields = adapter->quota_yields;
+    metrics->load.body_bytes = adapter->body_bytes;
+    metrics->load.body_callbacks = adapter->body_callbacks;
+    metrics->load.peak_buffered_bytes =
+        adapter->peak_buffered_bytes;
+    metrics->load.total_pump_us = adapter->network_us;
+    metrics->load.maximum_pump_us =
+        adapter->maximum_pump_us;
+    metrics->adapter_request_wall_us =
+        adapter->request_wall_us;
+    metrics->adapter_transport_total_us =
+        adapter->transport_total_us;
+    metrics->adapter_dns_us = adapter->dns_us;
+    metrics->adapter_tcp_us = adapter->tcp_us;
+    metrics->adapter_tls_us = adapter->tls_us;
+    metrics->adapter_server_us = adapter->server_us;
+    metrics->adapter_body_transfer_us =
+        adapter->body_transfer_us;
+    metrics->adapter_admission_collect_us =
+        adapter->admission_collect_us;
+    metrics->adapter_transport_samples =
+        adapter->transport_samples;
+    metrics->adapter_reused_connections =
+        adapter->reused_connections;
+    metrics->adapter_document_cache_hits =
+        adapter->document_cache_hits;
+    metrics->adapter_document_cache_stores =
+        adapter->document_cache_stores;
+    metrics->maximum_transform_slice_us =
+        adapter->maximum_transform_slice_us;
+    metrics->transform_slices =
+        adapter->build_slices;
+    metrics->transform_quota_overruns =
+        adapter->transform_quota_overruns;
+    if (adapter->maximum_irreducible_unit_us
+            > metrics->maximum_irreducible_unit_us) {
+        metrics->maximum_irreducible_unit_us =
+            adapter->maximum_irreducible_unit_us;
+    }
+}
+
+static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
+    BrowserEngine *engine, NavigationLoadStatus terminal)
+{
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    (void) navigation_load_metrics(work->load, &work->metrics.load);
+    if (work->adapter != NULL) {
+        SiteAdapterLoadMetrics adapter = {0};
+        if (site_adapter_load_metrics(work->adapter, &adapter)) {
+            browser_engine_copy_adapter_metrics(&work->metrics, &adapter);
+        }
+    }
+    uint64_t finished_us =
+        tilefinch_platform_monotonic_time_us();
+    work->metrics.elapsed_us =
+        finished_us >= work->started_us
+            ? finished_us - work->started_us : 0;
+    bool succeeded = terminal == NAVIGATION_LOAD_SUCCEEDED
+        && engine->navigation.page.loaded;
+    if (work->hooks_installed) {
+        (void) navigation_set_candidate_commit_hooks(
+            &engine->navigation, NULL, NULL, NULL, NULL);
+        work->hooks_installed = false;
+    }
+    if (engine->candidate_shell_prepared
+        || engine->candidate_render.budget != NULL) {
+        browser_engine_abort_candidate_shell(engine);
+    }
+    if (succeeded) {
+        succeeded = browser_engine_bind_current_full_document(engine);
+    } else if (engine->navigation.page.loaded
+               && work->previous_backing_valid) {
+        engine->backing = work->previous_backing;
+        (void) document_backing_install(
+            &engine->backing, &engine->navigation);
+        browser_engine_navigation_restore_history(engine, work);
+    } else {
+        document_backing_clear(&engine->backing);
+    }
+    bool had_provisional = engine->provisional_ready;
+    int provisional_scroll_y = had_provisional
+        ? engine->provisional_scroll_positions[
+              engine->provisional_current_frame]
+        : 0;
+    navigation_load_destroy(work->load);
+    work->load = NULL;
+    site_adapter_load_destroy(work->adapter);
+    work->adapter = NULL;
+    if (succeeded) {
+        browser_engine_census_page_fonts(engine);
+        browser_engine_navigation_restore_view(engine, work);
+        if (!work->history_move)
+            browser_engine_apply_initial_navigation_view(engine, true);
+        if (had_provisional && provisional_scroll_y > 0) {
+            (void) navigation_set_scroll(
+                &engine->navigation, provisional_scroll_y);
+            work->metrics.provisional_scroll_y =
+                navigation_current(&engine->navigation) == NULL
+                    ? 0
+                    : navigation_current(
+                          &engine->navigation)->scroll_y;
+        }
+        work->status = BROWSER_NAVIGATION_JOB_SUCCEEDED;
+        work->metrics.status = work->status;
+        work->metrics.completion_per_mille = 1000;
+        clear_error(engine);
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_INFO,
+            TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
+            "navigation-committed", "candidate load committed",
+            engine->navigation.loads_committed,
+            engine->navigation.page.document.node_count);
+    } else if (terminal == NAVIGATION_LOAD_CANCELLED) {
+        work->status = BROWSER_NAVIGATION_JOB_CANCELLED;
+        work->metrics.status = work->status;
+        snprintf(engine->last_error, sizeof(engine->last_error), "%.255s",
+                 engine->navigation.last_error[0] == '\0'
+                   ? "navigation cancelled"
+                   : engine->navigation.last_error);
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_INFO,
+            TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_CANCELLED,
+            "navigation-cancelled", engine->last_error, 0, 0);
+    } else {
+        const char *message = engine->navigation.last_error[0] != '\0'
+            ? engine->navigation.last_error
+            : (engine->last_error[0] != '\0'
+               ? engine->last_error : "navigation failed");
+        work->status = BROWSER_NAVIGATION_JOB_FAILED;
+        work->metrics.status = work->status;
+        (void) set_error_code(
+            engine, work->failure_subsystem, work->failure_code,
+            "navigation-failed", message);
+    }
+    if (!succeeded && had_provisional && engine->framebuffer != NULL) {
+        (void) tilefinch_platform_present_rgb565(
+            engine->framebuffer,
+            (size_t) engine->config.device.framebuffer_width,
+            (size_t) engine->config.device.framebuffer_height,
+            (size_t) engine->config.device.framebuffer_width);
+    }
+    browser_engine_reset_provisional_viewport(engine);
+    return work->status;
+}
+
+static bool browser_engine_begin_navigation_request(
+    BrowserEngine *engine, const char *url, const char *method,
+    const char *body, size_t body_length, const char *content_type,
+    size_t maximum_bytes, long timeout_ms, bool record_history)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || url == NULL || method == NULL
+        || url[0] == '\0' || strlen(url) >= NAVIGATION_URL_LIMIT
+        || maximum_bytes == 0 || timeout_ms <= 0
+        || browser_engine_navigation_pending(engine)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
+            "browser navigation job cannot be started");
+    }
+    browser_engine_store_current_focus(engine);
+    browser_engine_store_current_controls(engine);
+    /* Native HOME can become interactive before any page font file is read.
+       If the user outruns Wi-Fi association, finish the two-face baseline
+       here before the candidate is allowed to measure text. */
+    if (!browser_engine_prepare_navigation_fonts(engine, method, url)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, "font-baseline",
+            "bounded baseline font loading failed");
+    }
+    /* Release incumbent-page transport lanes before the candidate scheduler
+       tries to enqueue its authoritative document request. On PSP the six
+       shared descriptors can otherwise all belong to thumbnails, fonts or
+       script fetches from the page whose link was just activated. */
+    (void) navigation_cancel_network_work(
+        &engine->navigation, "superseded by a new navigation");
+    /* A candidate navigation keeps the incumbent page alive. End any gesture
+       against that page before input is suppressed, so a release after a
+       cancelled navigation cannot turn into a stale click. */
+    if (engine->controller_ready
+        && engine->controller.pointer_down_active) {
+        size_t relayouts = engine->navigation.incremental_relayouts;
+        bool ignored_activation = false;
+        (void) controller_pointer_event(
+            &engine->controller, CONTROLLER_POINTER_CANCEL, 0, 0,
+            &ignored_activation);
+        if (engine->render_ready
+            && relayouts != engine->navigation.incremental_relayouts) {
+            (void) browser_engine_apply_layout_damage(engine);
+        }
+    }
+    controller_pointer_discard_click(&engine->controller);
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    *work = (BrowserEngineNavigationWork) {
+        .status = BROWSER_NAVIGATION_JOB_PENDING,
+        .failure_subsystem = TILEFINCH_SUBSYSTEM_NETWORK,
+        .failure_code = TILEFINCH_DIAGNOSTIC_NETWORK_FAILED,
+        .previous_backing = engine->backing,
+        .previous_backing_valid =
+            document_backing_valid(&engine->backing),
+        .started_us =
+            tilefinch_platform_monotonic_time_us(),
+        .record_history = record_history
+    };
+    snprintf(work->url, sizeof(work->url), "%s", url);
+    work->metrics.status = BROWSER_NAVIGATION_JOB_PENDING;
+    if (engine->navigation.page.loaded)
+        work->metrics.incumbent_pages_preserved = 1;
+    engine->autofocus_pending = false;
+    browser_engine_cancel_idle_work(engine);
+    browser_engine_cancel_render_job(engine);
+    browser_engine_reset_provisional_viewport(engine);
+    (void) emit_diagnostic(
+        engine, TILEFINCH_DIAGNOSTIC_INFO,
+        TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
+        "navigation-start", "candidate load started",
+        engine->navigation.loads_started + 1, 0);
+    document_backing_uninstall(&engine->navigation);
+    if (!navigation_set_candidate_commit_hooks(
+            &engine->navigation, browser_engine_prepare_candidate_shell,
+            browser_engine_abort_candidate_shell,
+            browser_engine_commit_candidate_shell, engine)) {
+        if (work->previous_backing_valid) {
+            engine->backing = work->previous_backing;
+            (void) document_backing_install(
+                &engine->backing, &engine->navigation);
+        }
+        work->status = BROWSER_NAVIGATION_JOB_FAILED;
+        work->metrics.status = work->status;
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "candidate-shell-hook",
+            "could not install the candidate render-shell transaction");
+    }
+    work->hooks_installed = true;
+    uint64_t generation = navigation_begin(&engine->navigation);
+    work->generation = generation;
+    uint64_t navigation_started_us =
+        tilefinch_platform_monotonic_time_us();
+    work->metrics.navigation_session_started_us =
+        navigation_started_us >= work->started_us
+            ? navigation_started_us - work->started_us : 0;
+    if (site_adapter_handles_navigation(method, url)) {
+        char error[256] = {0};
+        SiteAdapterPreferences preferences = {
+            .youtube_compact_results = engine->youtube_compact_results
+        };
+        work->adapter = site_adapter_load_begin(
+            &engine->budget, &engine->session, method, url, &preferences,
+            maximum_bytes, timeout_ms, error, sizeof(error));
+        if (work->adapter == NULL) {
+            snprintf(engine->navigation.last_error,
+                     sizeof(engine->navigation.last_error), "%.255s",
+                     error[0] == '\0'
+                         ? "site adapter load allocation failed" : error);
+            (void) browser_engine_finish_navigation_work(
+                engine, NAVIGATION_LOAD_FAILED);
+            return false;
+        }
+        return true;
+    }
+    work->load = navigation_load_begin_request(
+        &engine->navigation, generation, url, method, body, body_length,
+        content_type, maximum_bytes, timeout_ms,
+        engine->config.device.navigation_viewport_width,
+        engine->fonts_ready ? &engine->fonts : NULL, NULL, record_history);
+    if (work->load == NULL) {
+        if (engine->navigation.last_error[0] == '\0') {
+            snprintf(engine->navigation.last_error,
+                     sizeof(engine->navigation.last_error), "%s",
+                     "navigation load allocation failed");
+        }
+        (void) browser_engine_finish_navigation_work(
+            engine, NAVIGATION_LOAD_FAILED);
+        return false;
+    }
+    return true;
+}
+
+bool browser_engine_begin_navigation_url(
+    BrowserEngine *engine, const char *url, size_t maximum_bytes,
+    long timeout_ms, bool record_history)
+{
+    return browser_engine_begin_navigation_request(
+        engine, url, "GET", NULL, 0, NULL,
+        maximum_bytes, timeout_ms, record_history);
+}
+
+bool browser_engine_begin_navigation_action(
+    BrowserEngine *engine, const ControllerAction *action,
+    size_t maximum_bytes, long timeout_ms)
+{
+    if (engine == NULL || action == NULL
+        || (action->type != CONTROLLER_ACTION_NAVIGATE
+            && action->type != CONTROLLER_ACTION_FORM_SUBMIT)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-action",
+            "controller action does not contain a navigation");
+    }
+    const char *current_url =
+        navigation_active_document_url(&engine->navigation);
+    if (current_url != NULL) {
+        snprintf(engine->navigation.pending_navigation_referer,
+                 sizeof(engine->navigation.pending_navigation_referer),
+                 "%s", current_url);
+    }
+    const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
+        ? action->method : "GET";
+    if (action->type == CONTROLLER_ACTION_NAVIGATE
+        && strcasecmp(method, "GET") == 0
+        && navigation_url_is_same_document(
+               &engine->navigation, action->url)) {
+        BrowserEngineNavigationWork *work = &engine->navigation_work;
+        *work = (BrowserEngineNavigationWork) {
+            .status = BROWSER_NAVIGATION_JOB_SUCCEEDED,
+            .started_us = tilefinch_platform_monotonic_time_us(),
+            .record_history = true
+        };
+        snprintf(work->url, sizeof(work->url), "%s", action->url);
+        bool committed = browser_engine_commit_same_document_action(
+            engine, action->url);
+        work->status = committed ? BROWSER_NAVIGATION_JOB_SUCCEEDED
+                                 : BROWSER_NAVIGATION_JOB_FAILED;
+        work->metrics.status = work->status;
+        work->metrics.completion_per_mille = committed ? 1000u : 0u;
+        if (committed) clear_error(engine);
+        return committed;
+    }
+    return browser_engine_begin_navigation_request(
+        engine, action->url, method,
+        action->body_length == 0 ? NULL : action->body,
+        action->body_length,
+        action->content_type[0] == '\0' ? NULL : action->content_type,
+        maximum_bytes, timeout_ms, true);
+}
+
+typedef struct {
+    size_t previous_index;
+    char previous_url[NAVIGATION_URL_LIMIT];
+    char url[NAVIGATION_URL_LIMIT];
+    int scroll_y;
+    int focus_kind;
+    size_t focus_index;
+    NavigationHistoryControl controls[NAVIGATION_HISTORY_CONTROL_LIMIT];
+    size_t control_count;
+} BrowserHistoryRestore;
+
+/* Snapshot the target before any navigation preparation can mutate the
+   history vector. No borrowed entry pointer survives this preparation. */
+static bool browser_engine_prepare_history(BrowserEngine *engine, bool forward,
+                                           BrowserHistoryRestore *restore)
+{
+    browser_engine_store_current_focus(engine);
+    browser_engine_store_current_controls(engine);
+    restore->previous_index = engine->navigation.history_index;
+    const char *active_url = navigation_active_document_url(&engine->navigation);
+    snprintf(restore->previous_url, sizeof(restore->previous_url), "%s",
+             active_url == NULL ? "" : active_url);
+    const NavigationEntry *entry = NULL;
+    bool moved = forward ? navigation_forward(&engine->navigation, &entry)
+                         : navigation_back(&engine->navigation, &entry);
+    if (!moved || entry == NULL) return false;
+    snprintf(restore->url, sizeof(restore->url), "%s", entry->url);
+    restore->scroll_y = entry->scroll_y;
+    restore->focus_kind = entry->focus_kind;
+    restore->focus_index = entry->focus_index;
+    restore->control_count = entry->control_count;
+    if (restore->control_count > NAVIGATION_HISTORY_CONTROL_LIMIT)
+        restore->control_count = NAVIGATION_HISTORY_CONTROL_LIMIT;
+    memcpy(restore->controls, entry->controls,
+           restore->control_count * sizeof(*restore->controls));
+    return true;
+}
+
+typedef enum {
+    HISTORY_RESTORE_OK,
+    HISTORY_RESTORE_PREFLIGHT_FAILED,
+    HISTORY_RESTORE_SETTLE_FAILED,
+    HISTORY_RESTORE_INPUT_FAILED
+} BrowserHistoryRestoreStatus;
+
+static BrowserHistoryRestoreStatus browser_engine_restore_history_document(
+    BrowserEngine *engine, bool forward, const BrowserHistoryRestore *restore)
+{
+    if (!navigation_restore_same_document_url(&engine->navigation,
+            restore->url, restore->previous_url)) {
+        browser_engine_rollback_same_document_cursor(engine, forward);
+        return HISTORY_RESTORE_PREFLIGHT_FAILED;
+    }
+    if (!browser_engine_settle_same_document_events(engine))
+        return HISTORY_RESTORE_SETTLE_FAILED;
+    lxb_dom_node_t *focus = browser_engine_semantic_focus(
+        engine, restore->focus_kind, restore->focus_index);
+    if (focus != NULL && !controller_focus_node(&engine->controller, focus))
+        return HISTORY_RESTORE_INPUT_FAILED;
+    if (!navigation_set_scroll(&engine->navigation, restore->scroll_y)
+        || !browser_engine_finish_input(engine, true))
+        return HISTORY_RESTORE_INPUT_FAILED;
+    return HISTORY_RESTORE_OK;
+}
+
+bool browser_engine_begin_navigation_history(
+    BrowserEngine *engine, bool forward, size_t maximum_bytes,
+    long timeout_ms)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || browser_engine_navigation_pending(engine)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-history",
+            "history navigation cannot be started");
+    }
+    BrowserHistoryRestore restore;
+    if (!browser_engine_prepare_history(engine, forward, &restore)) {
+        return set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
+            "navigation-history", forward ? "no forward history entry is available" : "no back history entry is available");
+    }
+    size_t previous_index = restore.previous_index;
+    const char *previous_url = restore.previous_url;
+    const char *url = restore.url;
+    int scroll_y = restore.scroll_y;
+    int focus_kind = restore.focus_kind;
+    size_t focus_index = restore.focus_index;
+    const NavigationHistoryControl *restore_controls = restore.controls;
+    size_t restore_control_count = restore.control_count;
+    if (navigation_url_is_same_document(
+            &engine->navigation, previous_url)) {
+        BrowserEngineNavigationWork *work = &engine->navigation_work;
+        *work = (BrowserEngineNavigationWork) {
+            .status = BROWSER_NAVIGATION_JOB_SUCCEEDED,
+            .previous_history_index = previous_index,
+            .restore_scroll_y = scroll_y,
+            .restore_focus_kind = focus_kind,
+            .restore_focus_index = focus_index,
+            .started_us = tilefinch_platform_monotonic_time_us(),
+            .history_move = true,
+            .history_forward = forward
+        };
+        snprintf(work->url, sizeof(work->url), "%s", url);
+        BrowserHistoryRestoreStatus result =
+            browser_engine_restore_history_document(engine, forward, &restore);
+        bool restored = result == HISTORY_RESTORE_OK;
+        if (result == HISTORY_RESTORE_SETTLE_FAILED) {
+            (void) set_error_code(engine, TILEFINCH_SUBSYSTEM_RENDER,
+                TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "history-event-settle",
+                "same-document history event layout could not be settled");
+        }
+        work->status = restored ? BROWSER_NAVIGATION_JOB_SUCCEEDED
+                                : BROWSER_NAVIGATION_JOB_FAILED;
+        work->metrics.status = work->status;
+        work->metrics.completion_per_mille = restored ? 1000u : 0u;
+        if (restored) clear_error(engine);
+        return restored;
+    }
+    bool began = browser_engine_begin_navigation_request(
+        engine, url, "GET", NULL, 0u, NULL,
+        maximum_bytes, timeout_ms, false);
+    /* begin_navigation_request snapshots the currently indexed entry. During
+       a history move the cursor already names the target while the incumbent
+       DOM is still displayed, so restore the target metadata captured above
+       instead of binding the incumbent controls to the target URL. Do this
+       even when request preparation fails so a later retry still has the
+       original target state. */
+    NavigationEntry *target_entry =
+        &engine->navigation.history[engine->navigation.history_index];
+    target_entry->focus_kind = focus_kind;
+    target_entry->focus_index = focus_index;
+    target_entry->control_count = restore_control_count;
+    memcpy(target_entry->controls, restore_controls,
+           restore_control_count * sizeof(*restore_controls));
+    if (!began) {
+        browser_engine_rollback_same_document_cursor(engine, forward);
+        return false;
+    }
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    work->history_move = true;
+    work->history_forward = forward;
+    work->previous_history_index = previous_index;
+    work->restore_scroll_y = scroll_y;
+    work->restore_focus_kind = focus_kind;
+    work->restore_focus_index = focus_index;
+    work->restore_control_count = restore_control_count;
+    memcpy(work->restore_controls, restore_controls,
+           restore_control_count * sizeof(*restore_controls));
+    return true;
+}
+
+BrowserNavigationJobStatus browser_engine_pump_navigation(
+    BrowserEngine *engine, const BrowserNavigationJobQuota *quota)
+{
+    if (engine == NULL) return BROWSER_NAVIGATION_JOB_FAILED;
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    if (work->status != BROWSER_NAVIGATION_JOB_PENDING)
+        return work->status;
+    if (work->adapter != NULL) {
+        uint64_t started_us =
+            tilefinch_platform_monotonic_time_us();
+        work->metrics.pump_calls++;
+        const FetchPumpQuota *fetch_quota =
+            quota == NULL ? NULL : &quota->load.fetch;
+        SiteAdapterLoadStatus adapter_status =
+            site_adapter_load_pump(work->adapter, fetch_quota);
+        if (adapter_status == SITE_ADAPTER_LOAD_PENDING)
+            return BROWSER_NAVIGATION_JOB_PENDING;
+        SiteAdapterDocument document = {0};
+        bool acquired = adapter_status == SITE_ADAPTER_LOAD_SUCCEEDED
+            && site_adapter_load_take_document(work->adapter, &document);
+        uint64_t parse_before = engine->navigation.performance.parse_us;
+        uint64_t style_before = engine->navigation.performance.style_us;
+        uint64_t resource_before = engine->navigation.performance.resource_us;
+        uint64_t layout_before = engine->navigation.performance.layout_us;
+        uint64_t runtime_before = engine->navigation.performance.runtime_us;
+        uint64_t commit_started_us = acquired
+            ? tilefinch_platform_monotonic_time_us() : 0;
+        bool committed = acquired && navigation_commit_static_html(
+            &engine->navigation, work->generation, work->url,
+            document.html, document.html_length,
+            engine->config.device.navigation_viewport_width,
+            engine->fonts_ready ? &engine->fonts : NULL, NULL,
+            work->record_history);
+        uint64_t commit_finished_us = acquired
+            ? tilefinch_platform_monotonic_time_us() : 0;
+        if (acquired) {
+            NavigationPerformance *performance =
+                &engine->navigation.performance;
+#define ADAPTER_DELTA(output, input, before) \
+            work->metrics.output = performance->input >= (before) \
+                ? performance->input - (before) : 0
+            ADAPTER_DELTA(adapter_parse_us, parse_us, parse_before);
+            ADAPTER_DELTA(adapter_style_us, style_us, style_before);
+            ADAPTER_DELTA(
+                adapter_resource_us, resource_us, resource_before);
+            ADAPTER_DELTA(adapter_layout_us, layout_us, layout_before);
+            ADAPTER_DELTA(adapter_runtime_us, runtime_us, runtime_before);
+#undef ADAPTER_DELTA
+            work->metrics.adapter_commit_us =
+                commit_finished_us >= commit_started_us
+                    ? commit_finished_us - commit_started_us : 0;
+        }
+        if (acquired) {
+            engine->navigation.last_http_status = document.status_code;
+            snprintf(engine->navigation.last_server,
+                     sizeof(engine->navigation.last_server), "%s",
+                     document.server);
+            snprintf(engine->navigation.last_cf_mitigated,
+                     sizeof(engine->navigation.last_cf_mitigated), "%s",
+                     document.cf_mitigated);
+        }
+        site_adapter_document_destroy(&document);
+        uint64_t finished_us =
+            tilefinch_platform_monotonic_time_us();
+        uint64_t unit_us = finished_us >= started_us
+            ? finished_us - started_us : 0;
+        SiteAdapterLoadMetrics adapter_metrics = {0};
+        (void) site_adapter_load_metrics(
+            work->adapter, &adapter_metrics);
+        work->metrics.maximum_irreducible_unit_us =
+            unit_us > adapter_metrics.maximum_irreducible_unit_us
+                ? unit_us : adapter_metrics.maximum_irreducible_unit_us;
+        work->metrics.maximum_transform_slice_us =
+            adapter_metrics.maximum_transform_slice_us;
+        work->metrics.transform_slices =
+            adapter_metrics.build_slices;
+        work->metrics.transform_quota_overruns =
+            adapter_metrics.transform_quota_overruns;
+        uint64_t advisory_us = quota == NULL
+            ? 0 : quota->load.maximum_parser_time_us;
+        if (advisory_us != 0
+            && work->metrics.maximum_irreducible_unit_us
+                   > advisory_us) {
+            work->metrics.irreducible_unit_overruns++;
+        }
+        if (!acquired) {
+            const char *adapter_error =
+                site_adapter_load_error(work->adapter);
+            snprintf(engine->navigation.last_error,
+                     sizeof(engine->navigation.last_error), "%.255s",
+                     adapter_status == SITE_ADAPTER_LOAD_CANCELLED
+                         ? "site adapter navigation cancelled"
+                         : (adapter_error[0] == '\0'
+                            ? "site adapter produced no document"
+                            : adapter_error));
+        }
+        return browser_engine_finish_navigation_work(
+            engine, committed
+                ? NAVIGATION_LOAD_SUCCEEDED
+                : (adapter_status == SITE_ADAPTER_LOAD_CANCELLED
+                    ? NAVIGATION_LOAD_CANCELLED
+                    : NAVIGATION_LOAD_FAILED));
+    }
+    if (work->load == NULL) return BROWSER_NAVIGATION_JOB_FAILED;
+    NavigationLoadStatus status = navigation_load_status(work->load);
+    const NavigationLoadQuota *load_quota =
+        quota == NULL ? NULL : &quota->load;
+    if (status == NAVIGATION_LOAD_PENDING) {
+        work->metrics.pump_calls++;
+        status = navigation_load_pump(work->load, load_quota);
+        if (status == NAVIGATION_LOAD_PENDING
+            || status == NAVIGATION_LOAD_READY_TO_FINISH) {
+            return BROWSER_NAVIGATION_JOB_PENDING;
+        }
+    } else if (status == NAVIGATION_LOAD_READY_TO_FINISH
+               || status == NAVIGATION_LOAD_FINALIZING) {
+        work->metrics.pump_calls++;
+        (void) navigation_load_finish(work->load, load_quota);
+        status = navigation_load_status(work->load);
+        if (status == NAVIGATION_LOAD_READY_TO_FINISH
+            || status == NAVIGATION_LOAD_FINALIZING) {
+            return BROWSER_NAVIGATION_JOB_PENDING;
+        }
+    }
+    return browser_engine_finish_navigation_work(engine, status);
+}
+
+void browser_engine_cancel_navigation(BrowserEngine *engine,
+                                      const char *reason)
+{
+    if (engine == NULL
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_PENDING) return;
+    const char *message = reason == NULL
+        ? "navigation cancelled by browser UI" : reason;
+    if (engine->navigation_work.adapter != NULL) {
+        site_adapter_load_cancel(
+            engine->navigation_work.adapter, message);
+        snprintf(engine->navigation.last_error,
+                 sizeof(engine->navigation.last_error), "%s", message);
+    } else {
+        navigation_load_cancel(engine->navigation_work.load, message);
+    }
+    (void) browser_engine_finish_navigation_work(
+        engine, NAVIGATION_LOAD_CANCELLED);
+}
+
+size_t browser_engine_cancel_network_work(
+    BrowserEngine *engine, const char *reason)
+{
+    return engine == NULL ? 0
+        : navigation_cancel_network_work(&engine->navigation, reason);
+}
+
+BrowserNavigationJobStatus browser_engine_navigation_status(
+    const BrowserEngine *engine)
+{
+    return engine == NULL ? BROWSER_NAVIGATION_JOB_FAILED
+                          : engine->navigation_work.status;
+}
+
+bool browser_engine_navigation_pending(const BrowserEngine *engine)
+{
+    return browser_engine_navigation_status(engine)
+        == BROWSER_NAVIGATION_JOB_PENDING;
+}
+
+BrowserNavigationReturnTarget browser_engine_last_navigation_return_target(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_SUCCEEDED
+        || !engine->navigation.page.loaded
+        || engine->navigation.history_count == 0u) {
+        return BROWSER_NAVIGATION_RETURN_NONE;
+    }
+    const BrowserEngineNavigationWork *work = &engine->navigation_work;
+    if (work->history_move) {
+        if (work->history_forward) {
+            return engine->navigation.history_index > 0u
+                ? BROWSER_NAVIGATION_RETURN_BACK
+                : BROWSER_NAVIGATION_RETURN_NONE;
+        }
+        return engine->navigation.history_index + 1u
+                   < engine->navigation.history_count
+            ? BROWSER_NAVIGATION_RETURN_FORWARD
+            : BROWSER_NAVIGATION_RETURN_NONE;
+    }
+    return engine->navigation.history_index > 0u
+        ? BROWSER_NAVIGATION_RETURN_BACK
+        : BROWSER_NAVIGATION_RETURN_NONE;
+}
+
+const char *browser_engine_pending_navigation_url(
+    const BrowserEngine *engine)
+{
+    return browser_engine_navigation_pending(engine)
+        ? engine->navigation_work.url : NULL;
+}
+
+bool browser_engine_navigation_job_metrics(
+    const BrowserEngine *engine, BrowserNavigationJobMetrics *metrics)
+{
+    if (engine == NULL || metrics == NULL) return false;
+    *metrics = engine->navigation_work.metrics;
+    metrics->status = engine->navigation_work.status;
+    if (engine->navigation_work.load != NULL) {
+        (void) navigation_load_metrics(
+            engine->navigation_work.load, &metrics->load);
+        metrics->completion_per_mille =
+            metrics->load.completion_per_mille;
+    } else if (engine->navigation_work.adapter != NULL) {
+        SiteAdapterLoadMetrics adapter = {0};
+        if (site_adapter_load_metrics(
+                engine->navigation_work.adapter, &adapter)) {
+            browser_engine_copy_adapter_metrics(metrics, &adapter);
+        }
+    }
+    if (engine->navigation_work.status
+            == BROWSER_NAVIGATION_JOB_SUCCEEDED) {
+        metrics->completion_per_mille = 1000;
+    } else if (metrics->completion_per_mille > 999u) {
+        metrics->completion_per_mille = 999u;
+    }
+    if (engine->navigation_work.load != NULL
+        || engine->navigation_work.adapter != NULL) {
+        uint64_t now_us =
+            tilefinch_platform_monotonic_time_us();
+        metrics->elapsed_us =
+            now_us >= engine->navigation_work.started_us
+                ? now_us - engine->navigation_work.started_us : 0;
+    }
+    return true;
+}
+
+bool browser_engine_provisional_viewport(
+    const BrowserEngine *engine, BrowserProvisionalViewport *viewport)
+{
+    if (viewport != NULL) memset(viewport, 0, sizeof(*viewport));
+    if (engine == NULL || viewport == NULL
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_PENDING
+        || !engine->provisional_ready
+        || engine->provisional_frames == NULL
+        || engine->provisional_frame_count == 0
+        || engine->provisional_current_frame
+               >= engine->provisional_frame_count) {
+        return false;
+    }
+    __sync_synchronize();
+    size_t current = engine->provisional_current_frame;
+    *viewport = (BrowserProvisionalViewport) {
+        .pixels = engine->provisional_frames
+                  + current * engine->provisional_frame_pixels,
+        .pixel_count = engine->provisional_frame_pixels,
+        .frame_count = engine->provisional_frame_count,
+        .current_frame = current,
+        .scroll_y = engine->provisional_scroll_positions[current],
+        .maximum_scroll_y =
+            engine->provisional_scroll_positions[
+                engine->provisional_frame_count - 1u],
+        .ready = true
+    };
+    return true;
+}
+
+bool browser_engine_scroll_provisional_page(
+    BrowserEngine *engine, int direction)
+{
+    BrowserProvisionalViewport before;
+    if (direction == 0
+        || !browser_engine_provisional_viewport(engine, &before)) {
+        return false;
+    }
+    size_t next = before.current_frame;
+    if (direction > 0 && next + 1u < before.frame_count) next++;
+    else if (direction < 0 && next > 0) next--;
+    if (next == before.current_frame) return false;
+    engine->provisional_current_frame = next;
+    __sync_synchronize();
+    engine->navigation_work.metrics.provisional_scrolls++;
+    engine->navigation_work.metrics.provisional_scroll_y =
+        engine->provisional_scroll_positions[next];
+    const uint16_t *frame = engine->provisional_frames
+        + next * engine->provisional_frame_pixels;
+    (void) tilefinch_platform_present_rgb565(
+        frame,
+        (size_t) engine->config.device.framebuffer_width,
+        (size_t) engine->config.device.framebuffer_height,
+        (size_t) engine->config.device.framebuffer_width);
+    return true;
+}
+
+typedef bool (*BrowserEngineLoadOperation)(BrowserEngine *engine,
+                                           uint64_t generation,
+                                           void *opaque);
+
+static bool browser_engine_run_load(BrowserEngine *engine,
+                                    BrowserEngineLoadOperation operation,
+                                    void *opaque,
+                                    TilefinchDiagnosticSubsystem subsystem,
+                                    TilefinchDiagnosticCode failure_code)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || operation == NULL) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
+            "browser engine is not active");
+    }
+    if (browser_engine_navigation_pending(engine)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
+            "a responsive navigation job is already active");
+    }
+    /* The incumbent remains the visual/DOM rollback candidate, but its
+       optional resource and script fetches must not occupy every shared PSP
+       transport descriptor ahead of the authoritative replacement. A
+       failed candidate can still restore the incumbent pixels and document;
+       only unfinished network embellishment is superseded. */
+    (void) navigation_cancel_network_work(
+        &engine->navigation, "superseded by a new navigation");
+    engine->autofocus_pending = false;
+    browser_engine_cancel_idle_work(engine);
+    (void) emit_diagnostic(
+        engine, TILEFINCH_DIAGNOSTIC_INFO,
+        TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
+        "navigation-start", "candidate load started",
+        engine->navigation.loads_started + 1, 0);
+    DocumentBacking previous = engine->backing;
+    bool previous_valid = document_backing_valid(&previous);
+    document_backing_uninstall(&engine->navigation);
+    if (!navigation_set_candidate_commit_hooks(
+            &engine->navigation, browser_engine_prepare_candidate_shell,
+            browser_engine_abort_candidate_shell,
+            browser_engine_commit_candidate_shell, engine)) {
+        if (previous_valid) {
+            engine->backing = previous;
+            (void) document_backing_install(&engine->backing,
+                                            &engine->navigation);
+        }
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "candidate-shell-hook",
+            "could not install the candidate render-shell transaction");
+    }
+    uint64_t generation = navigation_begin(&engine->navigation);
+    bool loaded = operation(engine, generation, opaque);
+    (void) navigation_set_candidate_commit_hooks(
+        &engine->navigation, NULL, NULL, NULL, NULL);
+    if (engine->candidate_shell_prepared
+        || engine->candidate_render.budget != NULL)
+        browser_engine_abort_candidate_shell(engine);
+    if (loaded && engine->navigation.page.loaded) {
+        if (!browser_engine_bind_current_full_document(engine)) loaded = false;
+    } else if (engine->navigation.page.loaded && previous_valid) {
+        engine->backing = previous;
+        (void) document_backing_install(&engine->backing,
+                                        &engine->navigation);
+    } else {
+        document_backing_clear(&engine->backing);
+    }
+    bool shell_ready = loaded && engine->navigation.page.loaded
+        && engine->controller_ready
+        && (engine->config.tile_capacity == 0 || engine->render_ready);
+    if (!loaded) {
+        const char *message = engine->navigation.last_error[0] != '\0'
+            ? engine->navigation.last_error
+            : (engine->last_error[0] != '\0'
+               ? engine->last_error : "navigation failed");
+        return set_error_code(engine, subsystem, failure_code,
+                              "navigation-failed", message);
+    }
+    if (!shell_ready) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "shell-commit",
+            "committed navigation has no promoted render shell");
+    }
+    /* Synchronous commits (native/generated pages and host loads) use this
+       path rather than finish_navigation_work. They need the same font census
+       so a late metric face cannot be skipped merely because no responsive
+       fetch job owned the commit. */
+    browser_engine_census_page_fonts(engine);
+    (void) emit_diagnostic(
+        engine, TILEFINCH_DIAGNOSTIC_INFO,
+        TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
+        "navigation-committed", "candidate load committed",
+        engine->navigation.loads_committed,
+        engine->navigation.page.document.node_count);
+    return true;
+}
+
+typedef struct {
+    const char *url;
+    const char *html;
+    size_t html_length;
+    bool record_history;
+} BrowserEngineHtmlLoad;
+
+static bool browser_engine_do_commit(BrowserEngine *engine,
+                                     uint64_t generation, void *opaque)
+{
+    const BrowserEngineHtmlLoad *load = opaque;
+    return navigation_commit_html(
+        &engine->navigation, generation, load->url, load->html,
+        load->html_length, engine->config.device.navigation_viewport_width,
+        engine->fonts_ready ? &engine->fonts : NULL, NULL,
+        load->record_history);
+}
+
+bool browser_engine_commit_html(BrowserEngine *engine, const char *url,
+                                const char *html, size_t html_length,
+                                bool record_history)
+{
+    if (url == NULL || html == NULL) return set_error_code(
+        engine, TILEFINCH_SUBSYSTEM_PARSER, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
+        "html-load", "HTML load is invalid");
+    BrowserEngineHtmlLoad load = {
+        .url = url,
+        .html = html,
+        .html_length = html_length,
+        .record_history = record_history
+    };
+    if (record_history && engine != NULL && engine->navigation.page.loaded) {
+        browser_engine_store_current_focus(engine);
+        browser_engine_store_current_controls(engine);
+    }
+    return browser_engine_run_load(
+        engine, browser_engine_do_commit, &load, TILEFINCH_SUBSYSTEM_PARSER,
+        TILEFINCH_DIAGNOSTIC_PARSE_FAILED);
+}
+
+typedef struct {
+    const char *url;
+    bool record_history;
+    bool used_site_adapter;
+    size_t adapter_source_bytes;
+    size_t adapter_result_count;
+    char adapter_name[32];
+} BrowserEngineUrlLoad;
+
+static bool browser_engine_do_load_url(BrowserEngine *engine,
+                                       uint64_t generation, void *opaque)
+{
+    BrowserEngineUrlLoad *load = opaque;
+#ifndef __PSP__
+    if (site_adapter_handles_navigation("GET", load->url)) {
+        SiteAdapterDocument document = {0};
+        char error[256] = {0};
+        SiteAdapterPreferences preferences = {
+            .youtube_compact_results = engine->youtube_compact_results
+        };
+        uint64_t started_ns = tilefinch_platform_monotonic_time_ns();
+        bool acquired = site_adapter_load_sync(
+                &engine->budget, &engine->session, "GET", load->url,
+                &preferences,
+                engine->config.maximum_document_bytes,
+                engine->config.navigation_timeout_ms,
+                &document, error, sizeof(error));
+        uint64_t finished_ns = tilefinch_platform_monotonic_time_ns();
+        if (finished_ns >= started_ns) {
+            engine->navigation.performance.network_us +=
+                (finished_ns - started_ns) / UINT64_C(1000);
+        }
+        if (!acquired) {
+            snprintf(engine->navigation.last_error,
+                     sizeof(engine->navigation.last_error), "%s",
+                     error[0] == '\0'
+                         ? "site adapter page failed" : error);
+            return false;
+        }
+        engine->navigation.last_http_status = document.status_code;
+        snprintf(engine->navigation.last_server,
+                 sizeof(engine->navigation.last_server), "%s",
+                 document.server);
+        snprintf(engine->navigation.last_cf_mitigated,
+                 sizeof(engine->navigation.last_cf_mitigated), "%s",
+                 document.cf_mitigated);
+        load->used_site_adapter = true;
+        load->adapter_source_bytes = document.source_bytes;
+        load->adapter_result_count = document.result_count;
+        snprintf(load->adapter_name, sizeof(load->adapter_name), "%s",
+                 document.adapter);
+        bool committed = navigation_commit_static_html(
+            &engine->navigation, generation, load->url,
+            document.html, document.html_length,
+            engine->config.device.navigation_viewport_width,
+            engine->fonts_ready ? &engine->fonts : NULL, NULL,
+            load->record_history);
+        site_adapter_document_destroy(&document);
+        return committed;
+    }
+#endif
+    return navigation_load_url(
+        &engine->navigation, generation, load->url,
+        engine->config.maximum_document_bytes,
+        engine->config.navigation_timeout_ms,
+        engine->config.device.navigation_viewport_width,
+        engine->fonts_ready ? &engine->fonts : NULL, NULL,
+        load->record_history);
+}
+
+bool browser_engine_load_url(BrowserEngine *engine, const char *url,
+                             bool record_history)
+{
+    if (engine == NULL) return false;
+    return browser_engine_load_url_with_limits(
+        engine, url, engine->config.maximum_document_bytes,
+        engine->config.navigation_timeout_ms, record_history);
+}
+
+bool browser_engine_load_url_with_limits(
+    BrowserEngine *engine, const char *url, size_t maximum_bytes,
+    long timeout_ms, bool record_history)
+{
+    if (url == NULL) return set_error_code(
+        engine, TILEFINCH_SUBSYSTEM_NETWORK, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
+        "url-load", "URL load is invalid");
+    if (maximum_bytes == 0 || timeout_ms <= 0) return set_error_code(
+        engine, TILEFINCH_SUBSYSTEM_NETWORK, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
+        "url-load", "URL load limits are invalid");
+    BrowserEngineUrlLoad load = {
+        .url = url,
+        .record_history = record_history
+    };
+    if (record_history && engine != NULL && engine->navigation.page.loaded) {
+        browser_engine_store_current_focus(engine);
+        browser_engine_store_current_controls(engine);
+    }
+    size_t saved_maximum = engine->config.maximum_document_bytes;
+    long saved_timeout = engine->config.navigation_timeout_ms;
+    engine->config.maximum_document_bytes = maximum_bytes;
+    engine->config.navigation_timeout_ms = timeout_ms;
+    bool loaded = browser_engine_run_load(
+        engine, browser_engine_do_load_url, &load, TILEFINCH_SUBSYSTEM_NETWORK,
+        TILEFINCH_DIAGNOSTIC_NETWORK_FAILED);
+    if (loaded && load.used_site_adapter) {
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_INFO,
+            TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
+            load.adapter_name, "bounded site-adapter page committed",
+            load.adapter_source_bytes, load.adapter_result_count);
+    }
+    /* Scripted form default actions (including small edge verification
+       forms) are navigations, not telemetry. Follow a bounded chain after
+       each committed document while the source DOM is still alive. */
+    for (size_t hop = 0; loaded && hop < 4; hop++) {
+        lxb_dom_node_t *form = NULL, *submitter = NULL;
+        if (engine->navigation.page.runtime == NULL
+            || !script_runtime_take_form_submission(
+                   engine->navigation.page.runtime, &form, &submitter)) {
+            break;
+        }
+        ControllerAction action;
+        if (!controller_build_form_action(
+                &engine->controller, form, submitter, false, &action)
+            || !browser_engine_execute_action(
+                   engine, &action, maximum_bytes, timeout_ms)) {
+            loaded = false;
+            break;
+        }
+    }
+    /* Match cooperative navigation: an explicit fragment owns the initial
+       viewport; otherwise a fresh history entry honors autofocus. History
+       traversal uses its separate saved-focus/scroll restoration path. */
+    if (loaded)
+        browser_engine_apply_initial_navigation_view(engine, record_history);
+    engine->config.maximum_document_bytes = saved_maximum;
+    engine->config.navigation_timeout_ms = saved_timeout;
+    return loaded;
+}
+
+bool browser_engine_history_move(BrowserEngine *engine, bool forward)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready) return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "history-move",
+            "browser engine is not active");
+    browser_engine_cancel_idle_work(engine);
+    BrowserHistoryRestore restore;
+    if (!browser_engine_prepare_history(engine, forward, &restore)) {
+        return set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
+            "history-move", "no history entry is available");
+    }
+    size_t previous_index = restore.previous_index;
+    const char *previous_url = restore.previous_url;
+    const char *url = restore.url;
+    int scroll_y = restore.scroll_y;
+    int focus_kind = restore.focus_kind;
+    size_t focus_index = restore.focus_index;
+    const NavigationHistoryControl *restore_controls = restore.controls;
+    size_t restore_control_count = restore.control_count;
+    if (navigation_url_is_same_document(
+            &engine->navigation, previous_url)) {
+        BrowserHistoryRestoreStatus result =
+            browser_engine_restore_history_document(engine, forward, &restore);
+        if (result == HISTORY_RESTORE_SETTLE_FAILED) {
+            return set_error_code(engine, TILEFINCH_SUBSYSTEM_RENDER,
+                TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "history-event-settle",
+                "same-document history event layout could not be settled");
+        }
+        if (result != HISTORY_RESTORE_OK) {
+            return set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "history-fragment",
+                "same-document history restoration failed");
+        }
+        clear_error(engine);
+        return true;
+    }
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    work->history_move = true;
+    work->restore_control_count = restore_control_count;
+    memcpy(work->restore_controls, restore_controls,
+           restore_control_count * sizeof(*restore_controls));
+    bool loaded = browser_engine_load_url(engine, url, false);
+    work->history_move = false;
+    work->restore_control_count = 0u;
+    if (!loaded) {
+        if (engine->navigation.history_index != previous_index) {
+            browser_engine_rollback_same_document_cursor(engine, forward);
+        }
+        return false;
+    }
+    lxb_dom_node_t *focus_node =
+        browser_engine_semantic_focus(engine, focus_kind, focus_index);
+    if (focus_node != NULL)
+        (void) controller_focus_node(&engine->controller, focus_node);
+    return navigation_set_scroll(&engine->navigation, scroll_y);
+}
+
+bool browser_engine_replace_history(
+    BrowserEngine *engine, const NavigationHistoryRecord *records,
+    size_t count, size_t current_index)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || browser_engine_navigation_pending(engine)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "history-replace",
+            "history cannot be replaced in the current engine state");
+    }
+    if (!navigation_replace_history(
+            &engine->navigation, records, count, current_index)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, "history-replace",
+            "bounded tab history could not be installed");
+    }
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_restore_view(
+    BrowserEngine *engine, int scroll_y, int focus_kind,
+    size_t focus_index)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    lxb_dom_node_t *focus = browser_engine_semantic_focus(
+        engine, focus_kind, focus_index);
+    if (focus != NULL)
+        (void) controller_focus_node(&engine->controller, focus);
+    if (!navigation_set_scroll(&engine->navigation, scroll_y)) return false;
+    return browser_engine_apply_focus_paint(engine);
+}
+
+static bool browser_engine_input_ready(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready && engine->navigation.page.loaded
+        && engine->controller_ready;
+}
+
+static bool browser_engine_finish_input(BrowserEngine *engine,
+                                        bool succeeded)
+{
+    if (engine != NULL && !engine->navigation.page.loaded) {
+        /* Event dispatch may have committed a destructive DOM mutation before
+           its replacement layout was refused. The controller can still
+           report a delivered/default action from the now-retired realm, so
+           page lifetime—not the action outcome—is the authoritative shell
+           ownership check. */
+        browser_engine_reset_shell(engine);
+        return false;
+    }
+    if (!succeeded) {
+        return false;
+    }
+    if (engine->render_ready
+        && engine->render_relayout_generation
+               != engine->navigation.incremental_relayouts
+        && !browser_engine_apply_layout_damage(engine)) return false;
+    if (!browser_engine_apply_focus_paint(engine)) return false;
+    browser_engine_store_current_focus(engine);
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_focus_move(BrowserEngine *engine, bool forward)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, forward ? controller_focus_next(&engine->controller)
+                        : controller_focus_previous(&engine->controller));
+}
+
+bool browser_engine_focus_direction(BrowserEngine *engine,
+                                    ControllerFocusDirection direction)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_focus_direction(&engine->controller, direction));
+}
+
+bool browser_engine_focus_at(BrowserEngine *engine, int x, int y)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_focus_at(&engine->controller, x, y));
+}
+
+bool browser_engine_pointer_event(BrowserEngine *engine,
+                                  ControllerPointerPhase phase,
+                                  int x, int y, bool *activate,
+                                  bool *page_changed)
+{
+    if (activate != NULL) *activate = false;
+    if (page_changed != NULL) *page_changed = false;
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    size_t relayouts = engine->navigation.incremental_relayouts;
+    const NavigationEntry *before_entry =
+        navigation_current(&engine->navigation);
+    int scroll_y = before_entry == NULL ? 0 : before_entry->scroll_y;
+    if (!browser_engine_finish_input(
+            engine, controller_pointer_event(
+                        &engine->controller, phase, x, y, activate))) {
+        return false;
+    }
+    const NavigationEntry *after_entry =
+        navigation_current(&engine->navigation);
+    if (page_changed != NULL) {
+        *page_changed =
+            relayouts != engine->navigation.incremental_relayouts
+            || (after_entry != NULL && after_entry->scroll_y != scroll_y);
+    }
+    return true;
+}
+
+bool browser_engine_pointer_commit_click(BrowserEngine *engine)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_commit_pointer_click(&engine->controller));
+}
+
+bool browser_engine_focus_node(BrowserEngine *engine, lxb_dom_node_t *node)
+{
+    if (!browser_engine_input_ready(engine) || node == NULL) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_focus_node(&engine->controller, node));
+}
+
+bool browser_engine_scroll_by(BrowserEngine *engine, int delta_y)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_scroll_by(
+                    &engine->controller, delta_y,
+                    engine->config.device.framebuffer_height));
+}
+
+bool browser_engine_scroll_settle(BrowserEngine *engine)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_scroll_settle(&engine->controller));
+}
+
+LayoutCursor browser_engine_pointer_cursor(const BrowserEngine *engine)
+{
+    return engine == NULL ? LAYOUT_CURSOR_AUTO
+        : controller_pointer_cursor(&engine->controller);
+}
+
+LayoutScrollbarWidth browser_engine_root_scrollbar_width(
+    const BrowserEngine *engine)
+{
+    return engine == NULL ? LAYOUT_SCROLLBAR_AUTO
+        : controller_root_scrollbar_width(&engine->controller);
+}
+
+bool browser_engine_scroll_step(BrowserEngine *engine, int direction,
+                                unsigned held_frames)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_scroll_step(
+                    &engine->controller, direction, held_frames,
+                    engine->config.device.framebuffer_height));
+}
+
+bool browser_engine_scroll_page(BrowserEngine *engine, int direction)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_scroll_page(
+                    &engine->controller, direction,
+                    engine->config.device.framebuffer_height));
+}
+
+bool browser_engine_scroll_to_edge(BrowserEngine *engine, bool bottom)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, bottom
+            ? controller_scroll_to_bottom(
+                  &engine->controller,
+                  engine->config.device.framebuffer_height)
+            : controller_scroll_to_top(
+                  &engine->controller,
+                  engine->config.device.framebuffer_height));
+}
+
+static void browser_engine_find_copy_snapshot(
+    const BrowserEngine *engine, BrowserFindSnapshot *snapshot)
+{
+    if (snapshot == NULL) return;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (engine == NULL || engine->find.query[0] == '\0') return;
+    snprintf(snapshot->query, sizeof(snapshot->query), "%s",
+             engine->find.query);
+    snapshot->match_count = engine->find.match_count;
+    snapshot->selected = engine->find.selected;
+    snapshot->truncated = engine->find.truncated;
+    snapshot->wrapped = engine->find.wrapped;
+}
+
+void browser_engine_find_clear(BrowserEngine *engine)
+{
+    if (engine == NULL) return;
+    page_find_clear(&engine->find);
+    engine->find_navigation_generation = 0;
+    engine->find_layout_generation = 0;
+}
+
+static bool browser_engine_find_rebuild(BrowserEngine *engine,
+                                        int nearest_y)
+{
+    char query[PAGE_FIND_QUERY_LIMIT + 1u];
+    snprintf(query, sizeof(query), "%s", engine->find.query);
+    if (!page_find_build(
+            &engine->find, &engine->budget,
+            &engine->navigation.page.layout, query)) return false;
+    engine->find_navigation_generation = engine->navigation.generation;
+    engine->find_layout_generation = engine->navigation.incremental_relayouts;
+    if (engine->find.match_count != 0)
+        (void) page_find_select_nearest(&engine->find, nearest_y);
+    return true;
+}
+
+static bool browser_engine_find_refresh(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->find.query[0] == '\0') return false;
+    if (!browser_engine_input_ready(engine)
+        || engine->find_navigation_generation
+               != engine->navigation.generation) {
+        browser_engine_find_clear(engine);
+        return false;
+    }
+    if (engine->find_layout_generation
+            == engine->navigation.incremental_relayouts) return true;
+    const PageFindMatch *selected = page_find_selected(&engine->find);
+    int nearest_y = selected == NULL ? 0 : selected->top;
+    if (page_find_refresh_geometry(
+            &engine->find, &engine->navigation.page.layout)) {
+        engine->find_layout_generation =
+            engine->navigation.incremental_relayouts;
+        return true;
+    }
+    if (!browser_engine_find_rebuild(engine, nearest_y)) {
+        browser_engine_find_clear(engine);
+        return false;
+    }
+    return true;
+}
+
+static bool browser_engine_find_jump(BrowserEngine *engine)
+{
+    const PageFindMatch *match = page_find_selected(&engine->find);
+    if (match == NULL) return false;
+    if (match->fixed) return true;
+    int context = engine->navigation.viewport.css_height / 3;
+    int target = match->top > context ? match->top - context : 0;
+    browser_engine_cancel_idle_work(engine);
+    return navigation_set_scroll(&engine->navigation, target);
+}
+
+bool browser_engine_find_begin(BrowserEngine *engine, const char *query,
+                               BrowserFindSnapshot *snapshot)
+{
+    if (snapshot != NULL) memset(snapshot, 0, sizeof(*snapshot));
+    if (!browser_engine_input_ready(engine) || query == NULL) return false;
+    browser_engine_find_clear(engine);
+    if (!page_find_build(
+            &engine->find, &engine->budget,
+            &engine->navigation.page.layout, query)) return false;
+    engine->find_navigation_generation = engine->navigation.generation;
+    engine->find_layout_generation = engine->navigation.incremental_relayouts;
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    if (engine->find.match_count != 0) {
+        (void) page_find_select_nearest(&engine->find, scroll_y);
+        (void) browser_engine_find_jump(engine);
+    }
+    browser_engine_find_copy_snapshot(engine, snapshot);
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_find_move(BrowserEngine *engine, int direction,
+                              BrowserFindSnapshot *snapshot)
+{
+    if (snapshot != NULL) memset(snapshot, 0, sizeof(*snapshot));
+    if (!browser_engine_find_refresh(engine) || direction == 0
+        || !page_find_move(&engine->find, direction)) return false;
+    (void) browser_engine_find_jump(engine);
+    browser_engine_find_copy_snapshot(engine, snapshot);
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_find_snapshot(BrowserEngine *engine,
+                                  BrowserFindSnapshot *snapshot)
+{
+    if (snapshot == NULL) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!browser_engine_find_refresh(engine)) return false;
+    browser_engine_find_copy_snapshot(engine, snapshot);
+    return true;
+}
+
+bool browser_engine_capture_text_anchor(
+    const BrowserEngine *engine,
+    char anchor[BROWSER_TEXT_ANCHOR_LIMIT + 1u], int *document_y)
+{
+    if (anchor != NULL) anchor[0] = '\0';
+    if (!browser_engine_input_ready(engine) || anchor == NULL) return false;
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    for (size_t at = 0; at < layout->count; at++) {
+        const DrawCommand *command = &layout->commands[at];
+        if (command->type != DRAW_TEXT || command->text == NULL
+            || command->text_length < 4u
+            || draw_command_is_text_shadow(command)
+            || command->y + command->height < scroll_y) continue;
+        size_t length = command->text_length;
+        if (length > BROWSER_TEXT_ANCHOR_LIMIT)
+            length = BROWSER_TEXT_ANCHOR_LIMIT;
+        while (length != 0 && length < command->text_length
+               && (((unsigned char) command->text[length] & 0xc0u)
+                       == 0x80u)) length--;
+        memcpy(anchor, command->text, length);
+        anchor[length] = '\0';
+        if (document_y != NULL) *document_y = command->y;
+        return length >= 4u;
+    }
+    return false;
+}
+
+bool browser_engine_restore_text_anchor(
+    BrowserEngine *engine, const char *anchor, int nearest_y)
+{
+    if (!browser_engine_input_ready(engine) || anchor == NULL
+        || anchor[0] == '\0') return false;
+    PageFindIndex temporary = {0};
+    bool restored = page_find_build(
+        &temporary, &engine->budget, &engine->navigation.page.layout,
+        anchor);
+    if (restored && temporary.match_count != 0) {
+        (void) page_find_select_nearest(&temporary, nearest_y);
+        const PageFindMatch *match = page_find_selected(&temporary);
+        restored = match != NULL
+            && (match->fixed
+                || navigation_set_scroll(&engine->navigation, match->top));
+    } else {
+        restored = false;
+    }
+    page_find_clear(&temporary);
+    return restored;
+}
+
+static void browser_engine_paint_find_highlights(BrowserEngine *engine,
+                                                 int scroll_y)
+{
+    if (!browser_engine_find_refresh(engine)
+        || engine->find.match_count == 0) return;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    const ViewportContext *viewport = &engine->navigation.viewport;
+    int viewport_width = engine->config.device.framebuffer_width;
+    int viewport_height = engine->config.device.framebuffer_height;
+    int visible_top = scroll_y;
+    int visible_bottom = scroll_y + viewport->css_height;
+    for (size_t match_index = 0;
+         match_index < engine->find.match_count; match_index++) {
+        const PageFindMatch *match = &engine->find.matches[match_index];
+        if (!match->fixed
+            && (match->bottom < visible_top || match->top > visible_bottom))
+            continue;
+        PageFindRect rects[PAGE_FIND_RECT_LIMIT];
+        size_t count = page_find_match_rects(
+            &engine->find, layout, match_index,
+            rects, PAGE_FIND_RECT_LIMIT);
+        for (size_t i = 0; i < count; i++) {
+            int css_y = rects[i].fixed ? rects[i].y
+                                      : rects[i].y - scroll_y;
+            int left = viewport_css_to_device(viewport, rects[i].x);
+            int top = viewport_css_to_device(viewport, css_y);
+            int right = viewport_css_to_device(
+                viewport, rects[i].x + rects[i].width);
+            int bottom = viewport_css_to_device(
+                viewport, css_y + rects[i].height);
+            render_paint_find_highlight(
+                engine->render.frame, engine->render.frame_pixels,
+                viewport_width, viewport_height,
+                left, top, right - left, bottom - top,
+                match_index == engine->find.selected);
+        }
+    }
+}
+
+bool browser_engine_text_value(const BrowserEngine *engine, char *output,
+                               size_t capacity, size_t *length)
+{
+    return browser_engine_input_ready(engine)
+        && controller_text_value(
+               &engine->controller, output, capacity, length);
+}
+
+bool browser_engine_text_input_info(
+    const BrowserEngine *engine, ControllerTextInputInfo *info)
+{
+    return browser_engine_input_ready(engine)
+        && controller_text_input_info(&engine->controller, info);
+}
+
+bool browser_engine_replace_text(BrowserEngine *engine, const char *utf8,
+                                 size_t length)
+{
+    if (!browser_engine_input_ready(engine) || utf8 == NULL) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_replace_text(&engine->controller, utf8, length));
+}
+
+bool browser_engine_insert_text(BrowserEngine *engine, const char *utf8,
+                                size_t length)
+{
+    if (!browser_engine_input_ready(engine) || utf8 == NULL) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_insert_text(&engine->controller, utf8, length));
+}
+
+bool browser_engine_backspace(BrowserEngine *engine)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    return browser_engine_finish_input(
+        engine, controller_backspace(&engine->controller));
+}
+
+bool browser_engine_activate(BrowserEngine *engine,
+                             ControllerAction *action)
+{
+    if (!browser_engine_input_ready(engine) || action == NULL) return false;
+    browser_engine_cancel_idle_work(engine);
+    size_t activations_before = engine->controller.activations;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t activation_begin = tilefinch_platform_monotonic_time_us();
+#endif
+    bool activated = controller_activate(&engine->controller, action);
+    /* A layout generation can retire the last focus region immediately
+       before activation. If failure occurred before the controller counted
+       an activation, no page event or default action ran. Resolve the exact
+       authored autofocus target and retry once so a single user press is not
+       split into repair-then-activate. Script/handler failures occur after
+       the activation count changes and are never replayed. */
+    if (!activated
+        && engine->controller.activations == activations_before
+        && browser_engine_apply_autofocus(engine)) {
+        engine->autofocus_pending = false;
+        activated = controller_activate(&engine->controller, action);
+    }
+    if (activated && action->type == CONTROLLER_ACTION_NAVIGATE
+        && navigation_url_is_same_document(
+               &engine->navigation, action->url)) {
+        /* A fragment activation is a local HTML default action. Resolve it
+           before returning to chrome so the PSP never associates Wi-Fi,
+           leaves Reader, or paints a network loading surface for work that
+           must not issue request bytes. */
+        activated = browser_engine_commit_same_document_action(
+            engine, action->url);
+        if (activated) {
+            action->type = CONTROLLER_ACTION_CONTROL;
+            action->url[0] = '\0';
+        }
+        return activated;
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t activation_dispatched = tilefinch_platform_monotonic_time_us();
+#endif
+    bool finished = browser_engine_finish_input(engine, activated);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    char activation_phases[160];
+    snprintf(activation_phases, sizeof(activation_phases),
+        "tilefinch-activation-phases: dispatch=%lluus finish=%lluus",
+        (unsigned long long) (activation_dispatched - activation_begin),
+        (unsigned long long) (tilefinch_platform_monotonic_time_us() - activation_dispatched));
+    tilefinch_platform_log_message(activation_phases);
+#endif
+    return finished;
+}
+
+bool browser_engine_restore_autofocus(BrowserEngine *engine)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    engine->autofocus_pending = false;
+    return browser_engine_finish_input(
+        engine, browser_engine_apply_autofocus(engine));
+}
+
+bool browser_engine_focused_provider_media_url(
+    const BrowserEngine *engine, char *url, size_t capacity)
+{
+    if (url != NULL && capacity != 0) url[0] = '\0';
+    if (engine == NULL || url == NULL || capacity == 0
+        || !browser_engine_input_ready(engine)) {
+        return false;
+    }
+    const LinkRegion *link = NULL;
+    if (!controller_focused_link_region(&engine->controller, &link)) {
+        return false;
+    }
+    lxb_dom_node_t *node = link->node;
+    static const lxb_char_t provider_media_attribute[] =
+        "data-tilefinch-provider-media";
+    if (browser_engine_attribute_owner(
+            node, provider_media_attribute,
+            sizeof(provider_media_attribute) - 1u) == NULL) {
+        return false;
+    }
+    const char *current_url =
+        navigation_active_document_url(&engine->navigation);
+    if (current_url != NULL
+        && fetch_resolve_url(current_url, link->url, url, capacity)) {
+        return true;
+    }
+    if (link->url_length >= capacity) return false;
+    memcpy(url, link->url, link->url_length);
+    url[link->url_length] = '\0';
+    return true;
+}
+
+static lxb_dom_node_t *browser_engine_provider_media_thumbnail(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL || !browser_engine_input_ready(engine)) return NULL;
+    const LinkRegion *link = NULL;
+    if (!controller_focused_link_region(&engine->controller, &link)) {
+        return NULL;
+    }
+    static const lxb_char_t provider_media_attribute[] =
+        "data-tilefinch-provider-media";
+    lxb_dom_node_t *root = browser_engine_attribute_owner(
+        link->node, provider_media_attribute,
+        sizeof(provider_media_attribute) - 1u);
+    if (root == NULL) return NULL;
+
+    /* Provider cards are deliberately shallow, but keep the search generic
+       and bounded so malformed markup cannot turn a focus sample into a
+       document traversal. */
+    lxb_dom_node_t *node = root->first_child;
+    for (unsigned inspected = 0; node != NULL && inspected < 64u;
+         inspected++) {
+        size_t name_length = 0;
+        const char *name = document_element_name(node, &name_length);
+        if (name != NULL && name_length == 3u
+            && strncasecmp(name, "img", 3u) == 0) {
+            return node;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        if (node == root) break;
+        node = node->next;
+    }
+    return NULL;
+}
+
+bool browser_engine_prepare_focused_provider_media_thumbnail(
+    BrowserEngine *engine)
+{
+    lxb_dom_node_t *thumbnail =
+        browser_engine_provider_media_thumbnail(engine);
+    if (thumbnail == NULL) return true;
+    NavigationPage *page = &engine->navigation.page;
+    const ImageResource *image = images_find_node(&page->images, thumbnail);
+    if (image != NULL && image->pixels != NULL) {
+        return true;
+    }
+    if (navigation_prioritize_deferred_image(
+            &engine->navigation, thumbnail)) return false;
+    /* The target was omitted or exhausted its bounded retry. Do not block
+       video resolution forever for pixels the image pipeline has already
+       classified as terminal. */
+    return true;
+}
+
+bool browser_engine_consume_media_request(
+    BrowserEngine *engine, ScriptMediaRequest *request)
+{
+    if (!browser_engine_input_ready(engine) || request == NULL
+        || engine->navigation.page.runtime == NULL
+        || !script_runtime_consume_media_request(
+               engine->navigation.page.runtime, request)) return false;
+    /* Native page media owns the scarce PSP audio hardware. Keep decoded
+       game sounds resident but suspend their channel until the page
+       explicitly resumes its AudioContext after returning. */
+    script_runtime_suspend_game_audio(engine->navigation.page.runtime);
+    bool allowed = request->source[0] != '\0'
+        && tilefinch_csp_allows_request(
+            &engine->navigation.page.document.content_security_policy,
+            TILEFINCH_DESTINATION_MEDIA, request->source);
+    if (!allowed) {
+        (void) script_runtime_update_media_state(
+            engine->navigation.page.runtime, request->node_handle,
+            SCRIPT_MEDIA_STATE_ERROR, 0, 0);
+        request->source[0] = '\0';
+    }
+    return true;
+}
+
+bool browser_engine_update_media_state(
+    BrowserEngine *engine, int64_t node_handle, ScriptMediaState state,
+    double current_time, double duration)
+{
+    return browser_engine_input_ready(engine) && node_handle != 0
+        && engine->navigation.page.runtime != NULL
+        && script_runtime_update_media_state(
+               engine->navigation.page.runtime, node_handle, state,
+               current_time, duration);
+}
+
+bool browser_engine_advance_runtime(BrowserEngine *engine,
+                                    unsigned elapsed_ms,
+                                    size_t maximum_callbacks,
+                                    bool *visible_layout_changed)
+{
+    if (visible_layout_changed != NULL) *visible_layout_changed = false;
+    if (!browser_engine_input_ready(engine)
+        || maximum_callbacks == 0) return false;
+    size_t before = engine->navigation.incremental_relayouts;
+    bool advanced = navigation_advance_runtime(
+        &engine->navigation, elapsed_ms, maximum_callbacks);
+    if (!engine->navigation.page.loaded) {
+        /* Timer/microtask dispatch shares the same mutation→relayout boundary
+           as direct input. A failed replacement retires the page; never leave
+           the old render/controller shell externally observable. */
+        browser_engine_reset_shell(engine);
+        return false;
+    }
+    bool changed = engine->navigation.incremental_relayouts != before;
+    if (changed && engine->render_ready
+        && !browser_engine_apply_layout_damage(engine)) return false;
+    bool visible_changed =
+        changed && engine->navigation.relayout_damage_valid;
+    if (visible_layout_changed != NULL) {
+        *visible_layout_changed = visible_changed;
+    }
+    if (changed && !visible_changed) {
+        engine->unchanged_runtime_frames_suppressed++;
+    }
+    if (advanced) clear_error(engine);
+    return advanced;
+}
+
+bool browser_engine_page_gamepad_available(const BrowserEngine *engine)
+{
+    return browser_engine_input_ready(engine)
+        && engine->navigation.page.loaded
+        && engine->navigation.page.runtime != NULL;
+}
+
+bool browser_engine_set_gamepad_state(
+    BrowserEngine *engine, const TilefinchGamepadState *state)
+{
+    /* A pending transactional navigation makes ordinary page input not-ready,
+       but its incumbent runtime is still live and may be restored on failure.
+       Deliver the disconnect to that realm instead of leaving a connected
+       Gamepad object behind after browser input authority has returned. */
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && navigation_set_gamepad_state(&engine->navigation, state);
+}
+
+bool browser_engine_set_page_visibility(BrowserEngine *engine, bool visible)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded)
+        return false;
+    ScriptRuntime *runtime = engine->navigation.page.runtime;
+    return runtime == NULL
+        || script_runtime_set_page_visibility(runtime, visible);
+}
+
+bool browser_engine_page_fullscreen_active(BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready && engine->navigation.page.loaded
+        && script_runtime_page_fullscreen_active(
+               engine->navigation.page.runtime);
+}
+
+bool browser_engine_exit_page_fullscreen(BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready && engine->navigation.page.loaded
+        && script_runtime_exit_page_fullscreen(
+               engine->navigation.page.runtime);
+}
+
+void browser_engine_suspend_page_presentations(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded)
+        return;
+    ScriptRuntime *runtime = engine->navigation.page.runtime;
+    script_runtime_suspend_game_audio(runtime);
+    (void) script_runtime_exit_page_fullscreen(runtime);
+}
+
+bool browser_engine_execute_action(BrowserEngine *engine,
+                                   const ControllerAction *action,
+                                   size_t maximum_bytes,
+                                   long timeout_ms)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->controller_ready || action == NULL
+        || maximum_bytes == 0 || timeout_ms <= 0) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "controller-action",
+            "controller action is invalid");
+    }
+    browser_engine_cancel_idle_work(engine);
+    /* Activation has already dispatched ordinary control behavior. Only
+       navigation and form submission require a second execution phase. */
+    if (action->type == CONTROLLER_ACTION_NONE
+        || action->type == CONTROLLER_ACTION_CONTROL
+        || action->type == CONTROLLER_ACTION_MEDIA) {
+        clear_error(engine);
+        return true;
+    }
+    const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
+        ? action->method : "GET";
+    if (action->type == CONTROLLER_ACTION_NAVIGATE
+        && strcasecmp(method, "GET") == 0
+        && navigation_url_is_same_document(
+               &engine->navigation, action->url)) {
+        browser_engine_store_current_focus(engine);
+        browser_engine_store_current_controls(engine);
+        return browser_engine_commit_same_document_action(
+            engine, action->url);
+    }
+    browser_engine_store_current_focus(engine);
+    browser_engine_store_current_controls(engine);
+    if (strcasecmp(method, "GET") == 0
+        && site_adapter_handles_navigation(method, action->url)) {
+        const char *current_url =
+            navigation_active_document_url(&engine->navigation);
+        if (current_url != NULL) {
+            snprintf(engine->navigation.pending_navigation_referer,
+                     sizeof(engine->navigation.pending_navigation_referer),
+                     "%s", current_url);
+        }
+        return browser_engine_load_url_with_limits(
+            engine, action->url, maximum_bytes, timeout_ms, true);
+    }
+    size_t loads_before = engine->navigation.loads_committed;
+    if (!controller_execute_action(
+            &engine->controller, action, maximum_bytes, timeout_ms)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_ENGINE,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "controller-action",
+            engine->navigation.last_error);
+    }
+    if (engine->navigation.loads_committed != loads_before
+        && (!browser_engine_bind_current_full_document(engine)
+            || !browser_engine_refresh_shell(engine))) return false;
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_commit_section_html(
+    BrowserEngine *engine, DocumentBacking *backing,
+    DocumentBackingSelection *selection, const char *url,
+    const char *html, size_t html_length, bool preserve_runtime,
+    bool record_history)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || url == NULL || html == NULL
+        || document_backing_kind(backing)
+               != DOCUMENT_BACKING_COMPRESSED_SECTIONS
+        || (selection != NULL
+            && (!selection->active || selection->backing != backing))) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_SECTIONS,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "section-commit",
+            "compressed section commit is invalid");
+    }
+    browser_engine_cancel_idle_work(engine);
+    size_t section = selection == NULL
+        ? backing->section_pager->current_section
+        : selection->pager_selection.section;
+    if (!navigation_set_runtime_section_identity(
+            &engine->navigation, section)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_SECTIONS,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "section-identity",
+            "section runtime identity could not be installed");
+    }
+    uint64_t generation = navigation_begin(&engine->navigation);
+    bool committed = preserve_runtime
+        ? navigation_commit_html_preserve_runtime(
+              &engine->navigation, generation, url, html, html_length,
+              engine->config.device.navigation_viewport_width,
+              engine->fonts_ready ? &engine->fonts : NULL, NULL,
+              record_history)
+        : navigation_commit_html(
+              &engine->navigation, generation, url, html, html_length,
+              engine->config.device.navigation_viewport_width,
+              engine->fonts_ready ? &engine->fonts : NULL, NULL,
+              record_history);
+    if (!committed) return set_error_code(
+        engine, TILEFINCH_SUBSYSTEM_SECTIONS,
+        TILEFINCH_DIAGNOSTIC_PARSE_FAILED, "section-commit",
+        engine->navigation.last_error);
+    if (selection != NULL && !document_backing_commit_section(selection)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_SECTIONS,
+            TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "section-selection",
+            "prepared section changed before commit");
+    }
+    if (!browser_engine_bind_document_backing(engine, backing)
+        || !browser_engine_refresh_shell(engine)) return false;
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_render_frame(BrowserEngine *engine,
+                                 const char *optional_ppm_path)
+{
+    if (engine == NULL || !engine->render_ready
+        || !engine->navigation.page.loaded) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "frame-render",
+            "render shell is not ready");
+    }
+    if (engine->render_relayout_generation
+            != engine->navigation.incremental_relayouts
+        && !browser_engine_apply_layout_damage(engine)) return false;
+    if (!browser_engine_apply_focus_paint(engine)) return false;
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    bool previous_scroll_valid = engine->render.last_frame_scroll_valid;
+    int previous_scroll_y = viewport_device_to_css(
+        &engine->navigation.viewport, engine->render.last_frame_scroll_y);
+    RenderCanvasFrameResult canvas_frame =
+        tile_cache_render_canvas_frame_fast(
+            &engine->render, scroll_y,
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height);
+    bool frame_rendered = canvas_frame == RENDER_CANVAS_FRAME_COMPLETE;
+    if (canvas_frame == RENDER_CANVAS_FRAME_FAILED
+        || (!frame_rendered && !tile_cache_render_frame(
+            &engine->render, scroll_y,
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height, NULL))) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "frame-render",
+            "frame rendering failed");
+    }
+    browser_engine_paint_find_highlights(engine, scroll_y);
+    int focus_x = 0, focus_y = 0, focus_width = 0, focus_height = 0;
+    ControllerFocusOutline focus_outline = {0};
+    if (controller_focused_rect(
+            &engine->controller, &focus_x, &focus_y,
+            &focus_width, &focus_height)
+        && controller_focused_outline_style(
+            &engine->controller, &focus_outline)) {
+        const ViewportContext *viewport = &engine->navigation.viewport;
+        int left = viewport_css_to_device(viewport, focus_x);
+        int top = viewport_css_to_device(
+            viewport, focus_y - scroll_y);
+        int right = viewport_css_to_device(
+            viewport, focus_x + focus_width);
+        int bottom = viewport_css_to_device(
+            viewport, focus_y - scroll_y + focus_height);
+        int outline_width = viewport_css_to_device(
+            viewport, focus_outline.width);
+        if (outline_width < 1) outline_width = 1;
+        int outline_offset = viewport_css_to_device(
+            viewport, focus_outline.offset);
+        render_paint_authored_focus_outline(
+            engine->render.frame, engine->render.frame_pixels,
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height,
+            left, top, right - left, bottom - top,
+            outline_width, outline_offset,
+            focus_outline.style,
+            focus_outline.color, focus_outline.alpha);
+    }
+    if (optional_ppm_path != NULL
+        && !render_write_frame_ppm(
+            optional_ppm_path, engine->render.frame,
+            engine->render.frame_pixels,
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "frame-write",
+            "rendered frame could not be written");
+    }
+    if (!previous_scroll_valid || scroll_y != previous_scroll_y) {
+        int prefetch_y = previous_scroll_valid && scroll_y < previous_scroll_y
+            ? scroll_y - 1
+            : scroll_y + engine->navigation.viewport.css_height
+                + TILEFINCH_TILE_SIZE - 1;
+        if (prefetch_y >= 0
+            && prefetch_y < engine->navigation.page.layout.height) {
+            tile_cache_schedule_prefetch_row(
+                &engine->render, prefetch_y,
+                engine->config.device.framebuffer_width);
+            /* Publication is foreground work. Leave speculative offscreen
+               rasterization to the caller's idle pump after presenting. */
+        }
+    }
+    clear_error(engine);
+    size_t compile_rejections =
+        engine->navigation.page.script_result.host_compile_rejections;
+    if (compile_rejections > engine->observed_compile_rejections) {
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_WARNING,
+            TILEFINCH_SUBSYSTEM_SCRIPT, TILEFINCH_DIAGNOSTIC_LIMIT_REACHED,
+            "compile-admission",
+            engine->navigation.page.script_result.error,
+            compile_rejections,
+            engine->navigation.page.script_result
+                .host_compile_projected_rejections);
+    }
+    engine->observed_compile_rejections = compile_rejections;
+    (void) emit_diagnostic(
+        engine, TILEFINCH_DIAGNOSTIC_DEBUG,
+        TILEFINCH_SUBSYSTEM_RENDER, TILEFINCH_DIAGNOSTIC_OK,
+        "frame-rendered", "", engine->render.frames_rendered,
+        engine->render.max_frame_us);
+    return true;
+}
+
+BrowserRenderJobStatus browser_engine_render_frame_bounded(
+    BrowserEngine *engine, uint64_t budget_us, size_t maximum_units)
+{
+    return browser_engine_render_frame_bounded_cancelable(
+        engine, budget_us, maximum_units, NULL);
+}
+
+BrowserRenderJobStatus browser_engine_render_frame_bounded_cancelable(
+    BrowserEngine *engine, uint64_t budget_us, size_t maximum_units,
+    const TilefinchCancellation *cancellation)
+{
+    if (engine == NULL || !engine->render_ready
+        || !engine->navigation.page.loaded) {
+        (void) set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "frame-job",
+            "render shell is not ready");
+        return BROWSER_RENDER_JOB_FAILED;
+    }
+    if (tilefinch_cancellation_requested(cancellation)) {
+        browser_engine_cancel_render_job(engine);
+        return BROWSER_RENDER_JOB_CANCELLED;
+    }
+    if (engine->render_relayout_generation
+            != engine->navigation.incremental_relayouts
+        && !browser_engine_apply_layout_damage(engine)) {
+        return BROWSER_RENDER_JOB_FAILED;
+    }
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    if (tile_cache_canvas_frame_fast_eligible(
+            &engine->render, scroll_y,
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height)) {
+        bool rendered = browser_engine_render_frame(engine, NULL);
+        if (tilefinch_cancellation_requested(cancellation)) {
+            return BROWSER_RENDER_JOB_CANCELLED;
+        }
+        return rendered ? BROWSER_RENDER_JOB_COMPLETE
+                        : BROWSER_RENDER_JOB_FAILED;
+    }
+    RenderFrameWorkResult prepared =
+        tile_cache_prepare_frame_bounded_cancelable(
+        &engine->render, scroll_y,
+        engine->config.device.framebuffer_width,
+        engine->config.device.framebuffer_height,
+        budget_us, maximum_units, cancellation);
+    if (prepared == RENDER_FRAME_WORK_CANCELLED) {
+        return BROWSER_RENDER_JOB_CANCELLED;
+    }
+    if (prepared == RENDER_FRAME_WORK_FAILED) {
+        (void) set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "frame-job",
+            "bounded tile preparation failed");
+        return BROWSER_RENDER_JOB_FAILED;
+    }
+    if (prepared == RENDER_FRAME_WORK_PENDING) {
+        return BROWSER_RENDER_JOB_PENDING;
+    }
+    bool rendered = browser_engine_render_frame(engine, NULL);
+    if (tilefinch_cancellation_requested(cancellation)) {
+        browser_engine_cancel_render_job(engine);
+        return BROWSER_RENDER_JOB_CANCELLED;
+    }
+    return rendered ? BROWSER_RENDER_JOB_COMPLETE
+                    : BROWSER_RENDER_JOB_FAILED;
+}
+
+void browser_engine_cancel_render_job(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->render_ready) return;
+    tile_cache_cancel_frame_work(&engine->render);
+}
+
+bool browser_engine_render_frame_pending(const BrowserEngine *engine)
+{
+    return engine != NULL && tile_cache_frame_work_pending(&engine->render);
+}
+
+bool browser_engine_canvas_frame_pending(const BrowserEngine *engine)
+{
+    return engine != NULL
+        && (engine->navigation.canvas_paint_damage_pending
+            || tile_cache_canvas_frame_work_pending(&engine->render));
+}
+
+bool browser_engine_run_idle_work(
+    BrowserEngine *engine, bool *visual_changed)
+{
+    if (visual_changed != NULL) *visual_changed = false;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->render_ready) return false;
+    /* Startup script tasks can still change the whole document's geometry.
+       Do not compete with them by reading/publishing optional fonts and
+       images only to reflow the same page again immediately. The committed
+       baseline frame and input remain usable, and tile preparation can run.
+       Timers and unrelated fetches do not delay resources. After 128 runtime
+       turns even continuously appended scripts stop deferring idle work. */
+    bool defer_for_startup = engine->navigation.page.runtime != NULL
+        && engine->navigation.page.script_result.runtime_ticks < 128u
+        && (engine->font_load != NULL
+            || (engine->font_requested_faces & (FontSetFaceMask)
+                ~(BROWSER_BASELINE_FONT_FACES | engine->font_failed_faces)) != 0
+            || navigation_background_resources_pending(&engine->navigation))
+        && script_runtime_has_pending_startup_scripts(engine->navigation.page.runtime);
+    if (defer_for_startup) {
+        /* Turns are not time: a device advancing 100 ms scripts reaches 128
+           turns only after a quarter of a minute, while an in-flight external
+           script keeps the predicate true the whole time. Bound the wait by
+           the wall clock as well, per runtime. */
+        uint64_t now = tilefinch_platform_monotonic_time_us();
+        const void *runtime = engine->navigation.page.runtime;
+        if (engine->startup_deferral_runtime != runtime
+            || engine->startup_deferral_generation != engine->navigation.generation) {
+            engine->startup_deferral_runtime = runtime;
+            engine->startup_deferral_generation = engine->navigation.generation;
+            engine->startup_deferral_started_us = now;
+        }
+        uint64_t limit = engine->config.startup_resource_deferral_us;
+        if (limit != 0 && now >= engine->startup_deferral_started_us
+            && now - engine->startup_deferral_started_us >= limit) {
+            defer_for_startup = false;
+        }
+    }
+    if (defer_for_startup) {
+        (void) tile_cache_run_idle_work(&engine->render,
+            engine->config.idle_work_budget_us,
+            engine->config.idle_work_maximum_units);
+        return true;
+    }
+    size_t focus_relayout_generation =
+        engine->navigation.incremental_relayouts;
+    size_t relayouts_before =
+        engine->navigation.performance.fast_relayouts
+        + engine->navigation.performance.full_relayouts;
+    bool font_work = false;
+    bool font_publication = false;
+    FontSetFaceMask optional = engine->font_requested_faces
+        & (FontSetFaceMask) ~(BROWSER_BASELINE_FONT_FACES
+                             | engine->font_failed_faces);
+    size_t publication_limit =
+        engine->config.fonts.maximum_publication_work_units;
+    bool font_guarded = optional != 0 && publication_limit != 0
+        && engine->navigation.page.loaded
+        && engine->navigation.page.layout.layout_work_units
+               > publication_limit;
+    if (font_guarded) {
+        /* Publishing the batch reflows the whole page at roughly its initial
+           layout cost. On a page this large that is seconds of blocked
+           input for a font change, and each cancelled attempt would only be
+           retried; keep the fallback faces for this page instead. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-font-batch: skipped faces=0x%02x work=%zu limit=%zu",
+                 (unsigned) optional,
+                 engine->navigation.page.layout.layout_work_units,
+                 publication_limit);
+        if (!engine->font_publication_guarded)
+            tilefinch_platform_log_message(message);
+#endif
+        /* Policy refusal applies to this layout, not to the font file for
+           the engine's lifetime. Later small/provider pages can load it. */
+        browser_engine_discard_staged_fonts(engine);
+        optional = 0;
+    }
+    engine->font_publication_guarded = font_guarded;
+    const struct {
+        FontSetFaceMask bit;
+        FontFace *face;
+        FontFace *staged;
+        const char *path;
+    } font_order[] = {
+        { FONT_SET_FACE_SERIF, &engine->fonts.serif, &engine->staged_fonts.serif,
+          engine->config.fonts.serif_path },
+        { FONT_SET_FACE_SANS_ITALIC, &engine->fonts.sans_italic,
+          &engine->staged_fonts.sans_italic,
+          engine->config.fonts.sans_italic_path },
+        { FONT_SET_FACE_SANS_BOLD, &engine->fonts.sans_bold,
+          &engine->staged_fonts.sans_bold,
+          engine->config.fonts.sans_bold_path },
+        { FONT_SET_FACE_METRIC_SANS_BOLD, &engine->fonts.metric_sans_bold,
+          &engine->staged_fonts.metric_sans_bold,
+          engine->config.fonts.metric_sans_bold_path },
+        { FONT_SET_FACE_SERIF_BOLD, &engine->fonts.serif_bold,
+          &engine->staged_fonts.serif_bold,
+          engine->config.fonts.serif_bold_path }
+    };
+    if (!browser_engine_navigation_pending(engine)) {
+        for (size_t at = 0;
+             at < sizeof(font_order) / sizeof(font_order[0]); at++) {
+            if ((optional & font_order[at].bit) == 0
+                || font_order[at].face->loaded
+                || font_order[at].staged->loaded
+                || (engine->font_load != NULL
+                    && engine->font_loading_face != font_order[at].bit)) {
+                continue;
+            }
+            font_work = true;
+            if (engine->font_load == NULL) {
+                size_t loaded = font_set_loaded_bytes(&engine->fonts);
+                size_t staged_bytes = font_set_loaded_bytes(&engine->staged_fonts);
+                size_t maximum = engine->config.fonts.maximum_total_bytes;
+                if (loaded >= maximum || staged_bytes >= maximum - loaded) {
+                    engine->font_failed_faces |= font_order[at].bit;
+                    break;
+                }
+                engine->font_load = font_face_load_begin(
+                    &engine->budget, font_order[at].path,
+                    maximum - loaded - staged_bytes);
+                if (engine->font_load == NULL) {
+                    engine->font_failed_faces |= font_order[at].bit;
+                    break;
+                }
+                engine->font_loading_face = font_order[at].bit;
+            }
+            FontFaceLoadStatus status = font_face_load_pump(
+                engine->font_load, BROWSER_FONT_IDLE_READ_BYTES,
+                font_order[at].staged);
+            font_face_load_destroy(
+                status == FONT_FACE_LOAD_PENDING ? NULL : engine->font_load);
+            if (status == FONT_FACE_LOAD_PENDING) break;
+            engine->font_load = NULL;
+            engine->font_loading_face = 0;
+            if (status != FONT_FACE_LOAD_COMPLETE) {
+                engine->font_failed_faces |= font_order[at].bit;
+                break;
+            }
+            break;
+        }
+        bool batch_ready = engine->font_load == NULL;
+        FontSetFaceMask staged = 0;
+        for (size_t at = 0; at < sizeof(font_order) / sizeof(font_order[0]); at++) {
+            if (font_order[at].staged->loaded) staged |= font_order[at].bit;
+            if ((optional & font_order[at].bit) != 0
+                && (engine->font_failed_faces & font_order[at].bit) == 0
+                && !font_order[at].face->loaded
+                && !font_order[at].staged->loaded) batch_ready = false;
+        }
+        if (batch_ready && staged != 0) font_work = true;
+        if (batch_ready && staged != 0
+            && !script_runtime_has_pending_mutations(engine->navigation.page.runtime)
+            && tilefinch_platform_monotonic_time_us()
+                   >= engine->font_publication_retry_us) {
+            /* This transaction can be abandoned without author mutation.
+               Let a frontend yield to new input at layout checkpoints; the
+               live page keeps its fallback metrics until adoption succeeds. */
+            bool publication_allowed = tilefinch_platform_cooperate(
+                "optional-font-publication", 1);
+            if (!publication_allowed) {
+                engine->font_publication_retry_us =
+                    tilefinch_platform_monotonic_time_us() + UINT64_C(250000);
+                (void) tilefinch_platform_cooperate("optional-font-publication", 0);
+                return true;
+            }
+            font_publication = true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            uint64_t font_started_us = tilefinch_platform_monotonic_time_us();
+#endif
+            for (size_t at = 0; at < sizeof(font_order) / sizeof(font_order[0]); at++) {
+                if ((staged & font_order[at].bit) == 0) continue;
+                *font_order[at].face = *font_order[at].staged;
+                memset(font_order[at].staged, 0, sizeof(*font_order[at].staged));
+            }
+            /* Metrics changed in place, not CSS. Reuse font-independent
+               styles but remeasure every geometry and ch-dependent value. */
+            layout_reuse_cache_begin_font_publication(
+                engine->navigation.page.layout_reuse);
+            bool adopted = navigation_relayout(&engine->navigation);
+            layout_reuse_cache_end_font_publication(
+                engine->navigation.page.layout_reuse);
+            if (!adopted) {
+                /* A supervisor cancel (Circle during idle work) stops the
+                   relayout at a cooperate checkpoint. The faces are still
+                   good: return them to staging and publish on a later pump
+                   instead of dropping the batch for the rest of the page.
+                   A refused build keeps the fallback faces for good. */
+                bool retry_later = engine->navigation.page.loaded
+                    && engine->navigation.layout_build_cancelled;
+                if (retry_later) engine->font_publication_retry_us =
+                    tilefinch_platform_monotonic_time_us() + UINT64_C(250000);
+                for (size_t at = 0; at < sizeof(font_order) / sizeof(font_order[0]); at++) {
+                    if ((staged & font_order[at].bit) == 0) continue;
+                    if (retry_later) {
+                        *font_order[at].staged = *font_order[at].face;
+                        memset(font_order[at].face, 0, sizeof(*font_order[at].face));
+                    } else {
+                        font_face_destroy(font_order[at].face);
+                    }
+                }
+                if (!retry_later) engine->font_failed_faces |= staged;
+                layout_reuse_cache_reset(engine->navigation.page.layout_reuse);
+            } else {
+                tile_cache_invalidate_glyphs(&engine->render);
+                if (visual_changed != NULL) *visual_changed = true;
+            }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            char message[128];
+            snprintf(message, sizeof(message),
+                     "tilefinch-font-batch: faces=0x%02x adopted=%d relayout=%lluus",
+                     (unsigned) staged, adopted,
+                     (unsigned long long) (tilefinch_platform_monotonic_time_us() - font_started_us));
+            tilefinch_platform_log_message(message);
+#endif
+            font_work = true;
+            (void) tilefinch_platform_cooperate("optional-font-publication", 0);
+        }
+    } else if (engine->font_load != NULL) {
+        font_work = true;
+    }
+    if (font_publication && !engine->navigation.page.loaded) {
+        /* The in-place rebuild path retires the page when its relayout
+           fails; that must surface like any other retired page rather than
+           be reported as a successful idle pump. */
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_NETWORK,
+            TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "font-publication",
+            "web font publication relayout retired the page");
+    }
+    NavigationBackgroundWorkOutcome background_outcome =
+        font_publication ? NAVIGATION_BACKGROUND_WORK_SUCCESS
+        : navigation_run_background_resources(&engine->navigation);
+    if (background_outcome == NAVIGATION_BACKGROUND_WORK_HARD_FAILURE) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_NETWORK,
+            TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "background-resources",
+            "background resource continuation failed");
+    }
+    size_t relayouts_after =
+        engine->navigation.performance.fast_relayouts
+        + engine->navigation.performance.full_relayouts;
+    if (engine->navigation.incremental_relayouts
+            != focus_relayout_generation) {
+        /* Optional font and image work share this continuation. Rebind once
+           after all of it so neither path can expose a stale focus to input. */
+        (void) controller_rebind_focus(&engine->controller);
+    }
+    if (relayouts_after != relayouts_before) {
+        /* The relayout already computed the union of changed command bounds.
+           Preserve decoded images, tiles outside that damage, and the active
+           frame job rather than destroying the complete render shell for one
+           optional font or thumbnail arrival. */
+        if (!browser_engine_apply_layout_damage(engine)) return false;
+        /* A background image/font continuation committed new layout and
+           display commands. The shell refresh alone does not repaint the
+           PSP framebuffer; tell the frontend to schedule that frame. */
+        if (visual_changed != NULL) *visual_changed = true;
+    }
+    /* Autofocus is a commitment of the settled layout, not of the earlier
+       parser checkpoint. Run it after optional font/resource work so a
+       relayout cannot immediately retire the region we just selected. */
+    bool layout_still_settling = font_work
+        || engine->font_load != NULL
+        || navigation_background_resources_pending(&engine->navigation);
+    bool autofocus_work = browser_engine_retry_deferred_autofocus(
+        engine, layout_still_settling);
+    if (autofocus_work) {
+        if (!browser_engine_finish_input(engine, true)) return false;
+        if (visual_changed != NULL) *visual_changed = true;
+    }
+    (void) tile_cache_run_idle_work(
+        &engine->render, engine->config.idle_work_budget_us,
+        engine->config.idle_work_maximum_units);
+    return autofocus_work || font_work
+        || navigation_background_resources_pending(&engine->navigation)
+        || tile_cache_idle_work_pending(&engine->render);
+}
+
+bool browser_engine_run_deferred_image_work(
+    BrowserEngine *engine, bool *visual_changed)
+{
+    if (visual_changed != NULL) *visual_changed = false;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->render_ready || browser_engine_navigation_pending(engine)) {
+        return false;
+    }
+    size_t relayouts_before =
+        engine->navigation.performance.fast_relayouts
+        + engine->navigation.performance.full_relayouts;
+    if (!navigation_run_deferred_image_work(&engine->navigation)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_NETWORK,
+            TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "deferred-image-work",
+            "deferred image continuation failed");
+    }
+    size_t relayouts_after =
+        engine->navigation.performance.fast_relayouts
+        + engine->navigation.performance.full_relayouts;
+    if (relayouts_after != relayouts_before) {
+        (void) controller_rebind_focus(&engine->controller);
+        if (!browser_engine_apply_layout_damage(engine)) return false;
+        if (visual_changed != NULL) *visual_changed = true;
+    }
+    return navigation_background_resources_pending(&engine->navigation);
+}
+
+void browser_engine_cancel_idle_work(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->render_ready) return;
+    tile_cache_cancel_idle_work(&engine->render);
+}
+
+uint64_t browser_engine_render_shell_serial(const BrowserEngine *engine)
+{
+    return engine == NULL ? 0 : engine->render_shell_serial;
+}
+
+bool browser_engine_reclaim_optional_memory(
+    BrowserEngine *engine, BrowserOptionalMemoryReclaim *reclaim)
+{
+    if (reclaim != NULL) memset(reclaim, 0, sizeof(*reclaim));
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) return false;
+
+    BrowserOptionalMemoryReclaim result = {0};
+    if (engine->font_load != NULL
+        || font_set_loaded_bytes(&engine->staged_fonts) != 0) {
+        size_t before = budget_remaining(&engine->budget);
+        browser_engine_discard_staged_fonts(engine);
+        size_t after = budget_remaining(&engine->budget);
+        result.font_staging_bytes = after > before ? after - before : 0;
+    }
+    if (engine->navigation_ready && engine->navigation.page.runtime != NULL) {
+        result.javascript_bytes = script_runtime_collect_and_trim(
+            engine->navigation.page.runtime);
+    }
+    if (engine->session_ready) {
+        result.session_cache_bytes = browser_session_cache_reclaim(
+            &engine->session, SIZE_MAX);
+    }
+    if (engine->render_ready) {
+        result.render_cache_bytes = tile_cache_reclaim_optional(
+            &engine->render);
+    }
+    result.total_bytes = result.font_staging_bytes;
+    if (result.total_bytes <= SIZE_MAX - result.javascript_bytes) {
+        result.total_bytes += result.javascript_bytes;
+    } else {
+        result.total_bytes = SIZE_MAX;
+    }
+    if (result.total_bytes <= SIZE_MAX - result.session_cache_bytes) {
+        result.total_bytes += result.session_cache_bytes;
+    } else {
+        result.total_bytes = SIZE_MAX;
+    }
+    if (result.total_bytes <= SIZE_MAX - result.render_cache_bytes) {
+        result.total_bytes += result.render_cache_bytes;
+    } else {
+        result.total_bytes = SIZE_MAX;
+    }
+    if (reclaim != NULL) *reclaim = result;
+    (void) emit_diagnostic(
+        engine, TILEFINCH_DIAGNOSTIC_DEBUG,
+        TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_OK,
+        "optional-memory-reclaimed", "", result.total_bytes,
+        budget_remaining(&engine->budget));
+    return true;
+}
+
+static void browser_optional_reclaim_add(
+    size_t *total, size_t amount)
+{
+    if (total == NULL) return;
+    *total = amount > SIZE_MAX - *total ? SIZE_MAX : *total + amount;
+}
+
+void browser_engine_prepare_optional_memory_reclaim(
+    BrowserEngine *engine, size_t target_remaining_bytes,
+    BrowserOptionalMemoryReclaimJob *job)
+{
+    if (job == NULL) return;
+    memset(job, 0, sizeof(*job));
+    job->target_remaining_bytes = target_remaining_bytes;
+    job->phase = BROWSER_OPTIONAL_RECLAIM_FONT_STAGING;
+    job->active = engine != NULL
+        && engine->state == BROWSER_ENGINE_ACTIVE
+        && budget_remaining(&engine->budget) < target_remaining_bytes;
+}
+
+bool browser_engine_optional_memory_reclaim_pending(
+    const BrowserOptionalMemoryReclaimJob *job)
+{
+    return job != NULL && job->active;
+}
+
+bool browser_engine_pump_optional_memory_reclaim(
+    BrowserEngine *engine, BrowserOptionalMemoryReclaimJob *job)
+{
+    if (job == NULL || !job->active) return true;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || budget_remaining(&engine->budget)
+               >= job->target_remaining_bytes) {
+        job->active = false;
+        return true;
+    }
+
+    size_t reclaimed = 0;
+    switch (job->phase) {
+    case BROWSER_OPTIONAL_RECLAIM_FONT_STAGING:
+        if (engine->font_load != NULL
+            || font_set_loaded_bytes(&engine->staged_fonts) != 0) {
+            size_t before = budget_remaining(&engine->budget);
+            browser_engine_discard_staged_fonts(engine);
+            size_t after = budget_remaining(&engine->budget);
+            reclaimed = after > before ? after - before : 0;
+            job->reclaimed.font_staging_bytes = reclaimed;
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_SESSION_CACHE;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_SESSION_CACHE:
+        if (engine->session_ready) {
+            /* Bound a frame by reclaimed bytes rather than draining the
+               entire cache. One oversized oldest entry may exceed the slice,
+               but the fixed entry table keeps lookup/free work finite. */
+            size_t remaining = budget_remaining(&engine->budget);
+            size_t deficit = remaining < job->target_remaining_bytes
+                ? job->target_remaining_bytes - remaining : 0;
+            size_t slice = deficit < 256u * 1024u
+                ? deficit : 256u * 1024u;
+            reclaimed = browser_session_cache_reclaim(
+                &engine->session, slice == 0 ? 1u : slice);
+            browser_optional_reclaim_add(
+                &job->reclaimed.session_cache_bytes, reclaimed);
+        }
+        if (reclaimed == 0)
+            job->phase = BROWSER_OPTIONAL_RECLAIM_RENDER_CACHE;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_RENDER_CACHE:
+        if (engine->render_ready) {
+            reclaimed = tile_cache_reclaim_optional(&engine->render);
+            job->reclaimed.render_cache_bytes = reclaimed;
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_JS_FIRST_GC;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_JS_FIRST_GC:
+        if (engine->navigation_ready
+            && engine->navigation.page.runtime != NULL) {
+            (void) script_runtime_collect_and_trim_phase(
+                engine->navigation.page.runtime,
+                SCRIPT_RUNTIME_COLLECT_FIRST_GC);
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_JS_SECOND_GC;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_JS_SECOND_GC:
+        if (engine->navigation_ready
+            && engine->navigation.page.runtime != NULL) {
+            (void) script_runtime_collect_and_trim_phase(
+                engine->navigation.page.runtime,
+                SCRIPT_RUNTIME_COLLECT_SECOND_GC);
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_JS_TRIM;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_JS_TRIM:
+        if (engine->navigation_ready
+            && engine->navigation.page.runtime != NULL) {
+            reclaimed = script_runtime_collect_and_trim_phase(
+                engine->navigation.page.runtime,
+                SCRIPT_RUNTIME_COLLECT_TRIM);
+            job->reclaimed.javascript_bytes = reclaimed;
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_PHASE_COUNT;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_PHASE_COUNT:
+        break;
+    }
+    browser_optional_reclaim_add(
+        &job->reclaimed.total_bytes, reclaimed);
+    if (budget_remaining(&engine->budget) >= job->target_remaining_bytes
+        || job->phase >= BROWSER_OPTIONAL_RECLAIM_PHASE_COUNT) {
+        job->active = false;
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_DEBUG,
+            TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_OK,
+            "optional-memory-reclaim-complete", "",
+            job->reclaimed.total_bytes, budget_remaining(&engine->budget));
+    }
+    return !job->active;
+}
+
+bool browser_engine_maintain_background_workers(BrowserEngine *engine)
+{
+    return engine == NULL || images_decode_worker_reap_cancelled(
+        &engine->budget);
+}
+
+const DocumentBacking *browser_engine_document_backing(
+    const BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        ? NULL : &engine->backing;
+}
+
+bool browser_engine_view_snapshot(
+    const BrowserEngine *engine, BrowserViewSnapshot *snapshot)
+{
+    if (snapshot == NULL) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready)
+        return false;
+
+    const NavigationSession *navigation = &engine->navigation;
+    const NavigationEntry *entry = navigation_current(navigation);
+    const char *pending_url = browser_engine_pending_navigation_url(engine);
+    const char *url = pending_url != NULL
+        ? pending_url
+        : navigation_active_document_url(navigation);
+    const char *title = pending_url != NULL
+        ? "Opening page"
+        : (navigation->page.loaded
+               ? navigation->page.document.title
+               : (entry == NULL ? NULL : entry->title));
+    snprintf(snapshot->url, sizeof(snapshot->url), "%s",
+             url == NULL ? "" : url);
+    snprintf(snapshot->title, sizeof(snapshot->title), "%s",
+             title == NULL ? "" : title);
+    snapshot->secure = strncmp(snapshot->url, "https://", 8) == 0;
+    snapshot->can_go_back =
+        navigation->history_count > 0 && navigation->history_index > 0;
+    snapshot->can_go_forward =
+        navigation->history_count > 0
+        && navigation->history_index + 1 < navigation->history_count;
+    snapshot->scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    snapshot->maximum_scroll_y = viewport_max_scroll_css(
+        &navigation->viewport, navigation->page.layout.height);
+    snapshot->loading = browser_engine_navigation_pending(engine);
+    snapshot->navigation_generation = navigation->generation;
+    snapshot->tls_verify_result = navigation->last_tls_verify_result;
+    snapshot->tls_verify_result_available =
+        navigation->last_tls_verify_result_available;
+    snapshot->tls_verification_failed =
+        navigation->last_tls_verification_failed;
+    snprintf(snapshot->tls_version, sizeof(snapshot->tls_version), "%s",
+             navigation->last_tls_version);
+    snprintf(snapshot->tls_peer_issuer,
+             sizeof(snapshot->tls_peer_issuer), "%s",
+             navigation->last_tls_peer_issuer);
+
+    if (engine->controller_ready) {
+        int x = 0, y = 0, width = 0, height = 0;
+        if (controller_focused_rect(
+                &engine->controller, &x, &y, &width, &height)) {
+            snapshot->has_focus = true;
+            snapshot->focus_x =
+                viewport_css_to_device(&navigation->viewport, x);
+            snapshot->focus_y = viewport_css_to_device(
+                &navigation->viewport, y - snapshot->scroll_y);
+            int right = viewport_css_to_device(
+                &navigation->viewport, x + width);
+            int bottom = viewport_css_to_device(
+                &navigation->viewport,
+                y - snapshot->scroll_y + height);
+            snapshot->focus_width = right - snapshot->focus_x;
+            snapshot->focus_height = bottom - snapshot->focus_y;
+            snapshot->focus_has_authored_outline =
+                engine->controller.has_authored_focus_outline;
+        }
+    }
+    return true;
+}
+
+bool browser_engine_frame_view(
+    const BrowserEngine *engine, BrowserFrameView *view)
+{
+    if (view == NULL) return false;
+    memset(view, 0, sizeof(*view));
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || engine->framebuffer == NULL)
+        return false;
+    view->pixels = engine->framebuffer;
+    view->pixel_count = engine->framebuffer_pixels;
+    view->width = engine->config.device.framebuffer_width;
+    view->height = engine->config.device.framebuffer_height;
+    view->stride = engine->config.device.framebuffer_width;
+    return true;
+}
+
+bool browser_engine_frontend_snapshot(
+    const BrowserEngine *engine, BrowserFrontendSnapshot *snapshot)
+{
+    if (snapshot == NULL) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE)
+        return false;
+    if (engine->framebuffer != NULL) {
+        snapshot->frame.pixels = engine->framebuffer;
+        snapshot->frame.pixel_count = engine->framebuffer_pixels;
+        snapshot->frame.width = engine->config.device.framebuffer_width;
+        snapshot->frame.height = engine->config.device.framebuffer_height;
+        snapshot->frame.stride = engine->config.device.framebuffer_width;
+    }
+    if (engine->navigation_ready)
+        snapshot->navigation = &engine->navigation;
+    if (engine->controller_ready)
+        snapshot->controller = &engine->controller;
+    return true;
+}
+
+bool browser_engine_fill_frame(BrowserEngine *engine, uint16_t color)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || engine->framebuffer == NULL)
+        return false;
+    for (size_t index = 0; index < engine->framebuffer_pixels; index++)
+        engine->framebuffer[index] = color;
+    return true;
+}
+
+bool browser_engine_set_user_css(
+    BrowserEngine *engine, const char *css, size_t length)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready)
+        return false;
+    return navigation_set_user_css(&engine->navigation, css, length);
+}
+
+bool browser_engine_apply_user_css(
+    BrowserEngine *engine, const char *css, size_t length)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || (css == NULL && length != 0)
+        || browser_engine_navigation_pending(engine)
+        || engine->candidate_shell_prepared
+        || engine->candidate_render.budget != NULL) {
+        return false;
+    }
+    NavigationSession *navigation = &engine->navigation;
+    lxb_dom_node_t *focused_node = engine->controller_ready
+        ? controller_focused_node(&engine->controller) : NULL;
+    NavigationUserCssTransaction *transaction =
+        navigation_apply_user_css_begin(navigation, css, length);
+    if (transaction == NULL) return false;
+
+    /* Build the replacement controller/tile cache while the incumbent shell
+       and the transaction's old layout remain owned. A real Budget refusal
+       therefore destroys only candidate ownership; rollback itself performs
+       no allocation and the already-painted incumbent remains usable. */
+    if (!browser_engine_prepare_candidate_shell(engine, navigation)) {
+        browser_engine_abort_candidate_shell(engine);
+        (void) navigation_apply_user_css_rollback(
+            navigation, transaction);
+        return false;
+    }
+    if (focused_node != NULL) {
+        (void) controller_restore_focus_node(
+            &engine->candidate_controller, focused_node);
+    }
+    browser_engine_commit_candidate_shell(engine);
+    navigation_apply_user_css_commit(navigation, transaction);
+    clear_error(engine);
+    return true;
+}
+
+static bool browser_engine_reader_root_matches(
+    const PocDocument *document, lxb_dom_node_t *root, ReaderPageKind kind)
+{
+    if (document == NULL || root == NULL || kind == READER_PAGE_RAW
+        || root->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || root->parent != document_body_node(document)) return false;
+    size_t name_length = 0;
+    const char *name = document_element_name(root, &name_length);
+    size_t marker_length = 0;
+    const char *marker = document_attribute(
+        root, "data-tilefinch-reader-root", &marker_length);
+    const char *expected = reader_page_kind_name(kind);
+    size_t expected_length = strlen(expected);
+    return name != NULL && name_length == 4u
+        && strncasecmp(name, "main", 4u) == 0
+        && marker != NULL && marker_length == expected_length
+        && memcmp(marker, expected, expected_length) == 0;
+}
+
+/* Discover only the root just appended by the synchronous native extractor.
+   Once that identity is retained, every later lookup goes through the stored
+   pointer/weak handle and never searches an author-controlled marker. */
+static lxb_dom_node_t *browser_engine_discover_reader_root(
+    PocDocument *document, ReaderPageKind kind)
+{
+    lxb_dom_node_t *body = document_body_node(document);
+    lxb_dom_node_t *root = body == NULL ? NULL : body->last_child;
+    return browser_engine_reader_root_matches(document, root, kind)
+        ? root : NULL;
+}
+
+static bool browser_engine_retain_reader_root(
+    NavigationPage *page, lxb_dom_node_t *root, ReaderPageKind kind)
+{
+    if (page == NULL || root == NULL) return false;
+    long handle = page->runtime == NULL ? 0
+        : script_runtime_node_weak_handle(page->runtime, root);
+    if (page->runtime != NULL && handle == 0) return false;
+    page->reader_root = root;
+    page->reader_root_kind = kind;
+    page->reader_root_handle = handle;
+    return true;
+}
+
+static lxb_dom_node_t *browser_engine_resolve_reader_root(
+    NavigationPage *page, ReaderPageKind kind)
+{
+    if (page == NULL || page->reader_root == NULL
+        || page->reader_root_kind != kind) return NULL;
+    lxb_dom_node_t *root = page->runtime == NULL
+        ? (page->reader_root_handle == 0 ? page->reader_root : NULL)
+        : (page->reader_root_handle == 0 ? NULL
+            : script_runtime_node_handle_resolve_connected(
+                  page->runtime, page->reader_root_handle));
+    return root == page->reader_root
+        && browser_engine_reader_root_matches(&page->document, root, kind)
+        ? root : NULL;
+}
+
+static lxb_dom_node_t *browser_engine_establish_reader_root(
+    NavigationPage *page, ReaderPageKind kind)
+{
+    lxb_dom_node_t *root = browser_engine_resolve_reader_root(page, kind);
+    if (root != NULL) return root;
+    /* Commit-time candidates are deliberately kept outside the author DOM
+       while delayed hydration settles. Their weak handle reserves exact
+       provenance before any author turn; connect only that same private root
+       at the native activation boundary. */
+    if (page != NULL && page->reader_root != NULL
+        && page->reader_root_kind == kind
+        && page->reader_root->parent == NULL) {
+        lxb_dom_node_t *retained = page->runtime == NULL
+            ? (page->reader_root_handle == 0 ? page->reader_root : NULL)
+            : (page->reader_root_handle == 0 ? NULL
+                : script_runtime_node_handle_resolve(
+                      page->runtime, page->reader_root_handle));
+        if (retained == page->reader_root
+            && reader_document_connect_prepared_view(
+                   &page->document, retained, kind)) {
+            return browser_engine_resolve_reader_root(page, kind);
+        }
+        return NULL;
+    }
+    /* A nonempty provenance record that no longer resolves means that exact
+       native root was detached or altered. Fail closed; never let a public
+       marker elsewhere in the author DOM replace it. */
+    if (page == NULL || page->reader_root != NULL
+        || page->reader_root_handle != 0
+        || page->reader_root_kind != READER_PAGE_RAW) return NULL;
+    root = browser_engine_discover_reader_root(&page->document, kind);
+    if (root == NULL) return NULL;
+    /* Callers reserve handle capacity before the extractor mutates the DOM.
+       Registration uses a fixed bridge table and cannot allocate, so failure
+       here indicates an invalid lifecycle rather than a recoverable partial
+       admission. Do not publish any provenance in that case. */
+    return browser_engine_retain_reader_root(page, root, kind)
+        ? root : NULL;
+}
+
+typedef enum {
+    BROWSER_READER_ALIAS_PREPARE = 0,
+    BROWSER_READER_ALIAS_DEFERRED
+} BrowserReaderAliasPhase;
+
+static void browser_engine_rebind_reader_visual_images(
+    TileCache *cache, bool ready, const LayoutDocument *source_layout,
+    const ImageAliasResult *alias_result, const ImageResources *images)
+{
+    if (cache == NULL || !ready || source_layout == NULL
+        || alias_result == NULL || images == NULL
+        || !cache->owns_visual_layout
+        || cache->source_layout != source_layout
+        || cache->layout != &cache->visual_layout) return;
+    (void) layout_rebind_image_resources(
+        &cache->visual_layout, alias_result->previous_items,
+        alias_result->previous_count, images);
+}
+
+static void browser_engine_alias_reader_images(
+    BrowserEngine *engine, NavigationSession *navigation,
+    lxb_dom_node_t *reader_root, BrowserReaderAliasPhase phase)
+{
+    if (engine == NULL || navigation == NULL || reader_root == NULL) return;
+    NavigationPage *page = &navigation->page;
+    if (page->images.count != 0u) {
+        ImageAliasResult alias_result =
+            images_alias_existing_document_subtree(
+                &page->stylesheet, &page->images, reader_root,
+                page->resource_base_url, page->document_url,
+                page->referrer_policy,
+                engine->config.resources.maximum_images);
+        if (alias_result.previous_items != NULL) {
+            (void) layout_rebind_image_resources(
+                &page->layout, alias_result.previous_items,
+                alias_result.previous_count, &page->images);
+            /* A scaled viewport keeps a cloned display list. Relocate only
+               caches tied to this exact source layout; an in-flight candidate
+               normally owns unrelated image resources. */
+            browser_engine_rebind_reader_visual_images(
+                &engine->render, engine->render_ready, &page->layout,
+                &alias_result, &page->images);
+            browser_engine_rebind_reader_visual_images(
+                &engine->candidate_render, engine->candidate_render_ready,
+                &page->layout, &alias_result, &page->images);
+        }
+        if (alias_result.aliased != 0u
+            && phase == BROWSER_READER_ALIAS_PREPARE
+            && page->deferred_image_job != NULL) {
+            /* Preparation aliases only resources whose layout transaction is
+               already committed. A deferred completion instead advances this
+               boundary after its immediately-following relayout succeeds. */
+            images_priority_load_commit_progress(
+                page->deferred_image_job);
+        }
+        images_alias_result_release(&page->images, &alias_result);
+        layout_reuse_cache_update_images(
+            page->layout_reuse, &page->images);
+    }
+    if (phase == BROWSER_READER_ALIAS_PREPARE) {
+        /* The Reader clone is a trusted native DOM mutation. Deferred alias
+           publication changes only the resource table, so it does not need
+           another document fingerprint scan. */
+        (void) navigation_accept_native_resource_fingerprint(navigation);
+    }
+}
+
+static void browser_engine_deferred_reader_images_ready(
+    void *opaque, NavigationSession *navigation)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || navigation == NULL
+        || !navigation->page.reader_analysis.prepared
+        || navigation->page.reader_analysis.kind == READER_PAGE_RAW) return;
+    lxb_dom_node_t *reader_root = browser_engine_resolve_reader_root(
+        &navigation->page, navigation->page.reader_analysis.kind);
+    browser_engine_alias_reader_images(
+        engine, navigation, reader_root, BROWSER_READER_ALIAS_DEFERRED);
+}
+
+bool browser_engine_prepare_reader(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    /* Basic and Reader share one hidden extracted-root slot. Never reinterpret
+       a prepared Basic tree as a Reader article or append a second clone. */
+    if (stored->prepared && stored->kind == READER_PAGE_BASIC) {
+        if (analysis != NULL) *analysis = *stored;
+        return false;
+    }
+    bool prepared_now = !stored->prepared;
+    if (prepared_now
+        && !script_runtime_node_handle_capacity_available(
+               engine->navigation.page.runtime)) {
+        ReaderDocumentAnalysis refused = {
+            .prepared = true, .bounded_out = true
+        };
+        if (analysis != NULL) *analysis = refused;
+        return false;
+    }
+    if (prepared_now
+        && !reader_document_prepare_with_stylesheet(
+               &engine->navigation.page.document,
+               &engine->navigation.page.stylesheet, stored)) return false;
+    lxb_dom_node_t *reader_root = stored->kind != READER_PAGE_RAW
+        ? browser_engine_establish_reader_root(
+              &engine->navigation.page, stored->kind)
+        : NULL;
+    if (prepared_now && stored->kind != READER_PAGE_RAW
+        && reader_root == NULL) {
+        ReaderPageKind failed_kind = stored->kind;
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, failed_kind);
+        *stored = (ReaderDocumentAnalysis) {0};
+    }
+    if (reader_root != NULL) {
+        browser_engine_alias_reader_images(
+            engine, &engine->navigation, reader_root,
+            BROWSER_READER_ALIAS_PREPARE);
+    }
+    if (analysis != NULL) *analysis = *stored;
+    /* Preparation is also the admission boundary used by frontends before
+       applying Reader CSS. A successfully analyzed RAW page has no semantic
+       Reader tree; report that as unavailable so a manual request cannot
+       broadly restyle an error, login, or application shell. The stored
+       analysis remains available through browser_engine_reader_analysis(). */
+    return stored->kind != READER_PAGE_RAW && reader_root != NULL;
+}
+
+bool browser_engine_analyze_reader(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || analysis == NULL
+        || !engine->navigation.page.loaded) return false;
+    /* A connected extracted root is already authoritative. Report its stored
+       analysis without rewalking source; otherwise keep this probe strictly
+       temporary so low-confidence auto mode cannot block a later Basic view. */
+    const ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (stored->prepared && stored->kind != READER_PAGE_RAW) {
+        *analysis = *stored;
+        return browser_engine_establish_reader_root(
+                   &engine->navigation.page, stored->kind) != NULL;
+    }
+    return reader_document_analyze_with_stylesheet(
+        &engine->navigation.page.document,
+        &engine->navigation.page.stylesheet, analysis);
+}
+
+bool browser_engine_prepare_basic_view(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (stored->prepared && stored->kind == READER_PAGE_BASIC) {
+        lxb_dom_node_t *root = browser_engine_resolve_reader_root(
+            &engine->navigation.page, READER_PAGE_BASIC);
+        if (analysis != NULL) *analysis = *stored;
+        return root != NULL;
+    }
+    /* An installed Reader tree owns the one extracted presentation slot.
+       Switching back to raw CSS is reversible; creating two hidden clones is
+       deliberately not. */
+    if (stored->prepared && stored->kind != READER_PAGE_RAW) {
+        if (analysis != NULL) *analysis = *stored;
+        return false;
+    }
+    if (!script_runtime_node_handle_capacity_available(
+            engine->navigation.page.runtime)) {
+        if (analysis != NULL) {
+            *analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+        }
+        return false;
+    }
+    ReaderDocumentAnalysis prepared = {0};
+    if (!reader_document_prepare_basic_complete_with_stylesheet(
+            &engine->navigation.page.document,
+            &engine->navigation.page.stylesheet, &prepared)) {
+        if (analysis != NULL) *analysis = prepared;
+        return false;
+    }
+    if (analysis != NULL) *analysis = prepared;
+    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out
+        || prepared.extraction_truncated) return false;
+    lxb_dom_node_t *root = browser_engine_establish_reader_root(
+        &engine->navigation.page, READER_PAGE_BASIC);
+    if (root == NULL) {
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, READER_PAGE_BASIC);
+        return false;
+    }
+    *stored = prepared;
+    browser_engine_alias_reader_images(
+        engine, &engine->navigation, root,
+        BROWSER_READER_ALIAS_PREPARE);
+    return true;
+}
+
+static bool browser_engine_activate_extracted_view(
+    BrowserEngine *engine, ReaderPageKind kind)
+{
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    NavigationPage *page = &engine->navigation.page;
+    if (!page->reader_analysis.prepared
+        || page->reader_analysis.kind != kind) return false;
+    lxb_dom_node_t *root = browser_engine_resolve_reader_root(page, kind);
+    if (root == NULL) return false;
+    /* Freeze only after frontend CSS has succeeded so a failed presentation
+       transaction leaves a functioning raw page and realm untouched. No
+       author turn occurs between synchronous prepare, CSS application, and
+       this exact-root validation. This makes the native clone's :last-child
+       presentation and delegated actions stable for both Reader and Basic. */
+    navigation_retire_current_page_scripts(&engine->navigation);
+    bool realms_retired = page->runtime == NULL;
+    for (size_t frame = 0; frame < page->frame_count; frame++)
+        realms_retired = realms_retired
+            && page->frames[frame].runtime == NULL;
+    return realms_retired && page->reader_root == root
+        && page->reader_root_handle == 0 && page->reader_root_kind == kind;
+}
+
+bool browser_engine_activate_reader_view(BrowserEngine *engine)
+{
+    if (engine == NULL) return false;
+    ReaderPageKind kind = engine->navigation.page.reader_analysis.kind;
+    if (kind != READER_PAGE_ARTICLE && kind != READER_PAGE_LISTING
+        && kind != READER_PAGE_WATCH) return false;
+    return browser_engine_activate_extracted_view(engine, kind);
+}
+
+bool browser_engine_activate_basic_view(BrowserEngine *engine)
+{
+    return browser_engine_activate_extracted_view(
+        engine, READER_PAGE_BASIC);
+}
+
+bool browser_engine_page_is_visually_blank(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready
+        && engine->navigation.page.loaded
+        && navigation_layout_is_visually_blank(
+               &engine->navigation.page.layout);
+}
+
+static bool browser_engine_has_script_degradation(
+    const NavigationSession *navigation)
+{
+    if (navigation == NULL || !navigation->page.loaded) return false;
+    const ScriptResult *result = &navigation->page.script_result;
+    bool heap_rejected = navigation->page.runtime != NULL
+        && script_runtime_heap_rejections(navigation->page.runtime) != 0u;
+    /* A realm retired by navigation_retire_exhausted_script_realms no longer
+       exposes its allocator counter. Its exact engine-authored summary is the
+       durable evidence for that already-completed transition. */
+    bool memory_realm_retired = navigation->page.runtime == NULL
+        && strcmp(result->summary,
+                  "JavaScript stopped at its memory limit") == 0;
+    return navigation->page.script_degradation_observed
+        || result->scripts_failed != 0u
+        || result->external_scripts_failed != 0u
+        || result->dynamic_scripts_failed != 0u
+        || result->dynamic_scripts_quota_rejected != 0u
+        || result->host_compile_rejections != 0u
+        || result->host_compile_watchdog_aborts != 0u
+        || result->uncaught_callback_errors != 0u
+        || result->interrupted || heap_rejected || memory_realm_retired;
+}
+
+static bool browser_engine_recovery_wall_settled(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL || engine->navigation.page.committed_us == 0u)
+        return false;
+    uint64_t now_us = browser_engine_recovery_now_us();
+    return now_us >= engine->navigation.page.committed_us
+        && now_us - engine->navigation.page.committed_us
+               >= BROWSER_RECOVERY_SETTLE_US;
+}
+
+static bool browser_engine_media_node_name_is(
+    lxb_dom_node_t *node, const char *wanted)
+{
+    size_t length = 0u;
+    const char *name = document_element_name(node, &length);
+    return name != NULL && length == strlen(wanted)
+        && strncasecmp(name, wanted, length) == 0;
+}
+
+static lxb_dom_node_t *browser_engine_media_walk_next(
+    lxb_dom_node_t *root, lxb_dom_node_t *node)
+{
+    if (node->first_child != NULL) return node->first_child;
+    while (node != NULL && node != root) {
+        if (node->next != NULL) return node->next;
+        node = node->parent;
+    }
+    return NULL;
+}
+
+static bool browser_engine_media_card_connected(
+    BrowserEngine *engine, lxb_dom_node_t *wanted)
+{
+    if (engine == NULL || wanted == NULL) return false;
+    PocDocument *document = &engine->navigation.page.document;
+    lxb_dom_node_t *root = document->html == NULL ? NULL
+        : lxb_dom_interface_node(document->html);
+    /* Exact provenance makes a bounded ancestry check sufficient. Unlike a
+       prefix DOM walk, it still recognizes the one native card if author
+       mutation moves it behind more than 16K siblings. */
+    size_t depth = 0u;
+    for (lxb_dom_node_t *node = wanted;
+         node != NULL && depth++ < 16384u; node = node->parent) {
+        if (node == root) return true;
+    }
+    return false;
+}
+
+static bool browser_engine_media_set_attribute(
+    lxb_dom_node_t *node, const char *name, const char *value)
+{
+    return node != NULL && name != NULL && value != NULL
+        && lxb_dom_element_set_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) name, strlen(name),
+               (const lxb_char_t *) value, strlen(value)) != NULL;
+}
+
+static lxb_dom_node_t *browser_engine_find_declared_media_anchor(
+    BrowserEngine *engine, const MediaDeclaredVideo *declared,
+    bool *author_video)
+{
+    if (author_video != NULL) *author_video = false;
+    if (engine == NULL || declared == NULL) return NULL;
+    PocDocument *document = &engine->navigation.page.document;
+    lxb_dom_node_t *root = document->html == NULL ? NULL
+        : lxb_dom_interface_node(document->html);
+    if (root == NULL) return NULL;
+    char declared_thumbnail[NAVIGATION_URL_LIMIT];
+    bool have_thumbnail = declared->thumbnail_url[0] != '\0'
+        && fetch_resolve_url(
+               engine->navigation.page.resource_base_url,
+               declared->thumbnail_url, declared_thumbnail,
+               sizeof(declared_thumbnail));
+    lxb_dom_node_t *matching_image = NULL;
+    size_t nodes = 0u;
+    for (lxb_dom_node_t *node = root;
+         node != NULL && nodes++ < 16384u;
+         node = browser_engine_media_walk_next(root, node)) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (browser_engine_media_node_name_is(node, "video")) {
+            if (author_video != NULL) *author_video = true;
+            return node;
+        }
+        if (!have_thumbnail || matching_image != NULL
+            || !browser_engine_media_node_name_is(node, "img")) continue;
+        const LayoutNodeBox *box = layout_box_for_node(
+            &engine->navigation.page.layout, node);
+        if (box == NULL || box->width <= 0 || box->height <= 0) continue;
+        size_t source_length = 0u;
+        const char *source = document_attribute(node, "src", &source_length);
+        if (source == NULL || source_length == 0u
+            || source_length >= NAVIGATION_URL_LIMIT) continue;
+        char raw[NAVIGATION_URL_LIMIT];
+        char resolved[NAVIGATION_URL_LIMIT];
+        memcpy(raw, source, source_length);
+        raw[source_length] = '\0';
+        if (fetch_resolve_url(
+                engine->navigation.page.resource_base_url, raw,
+                resolved, sizeof(resolved))
+            && strcmp(resolved, declared_thumbnail) == 0) {
+            matching_image = node;
+        }
+    }
+    return matching_image;
+}
+
+static void browser_engine_remove_media_card(
+    lxb_dom_node_t *card, lxb_dom_node_t *wrapped_image)
+{
+    if (card == NULL) return;
+    lxb_dom_node_t *parent = card->parent;
+    if (wrapped_image != NULL && parent != NULL) {
+        if (wrapped_image->parent == card) lxb_dom_node_remove(wrapped_image);
+        (void) lxb_dom_node_insert_before_spec(parent, wrapped_image, card);
+    }
+    if (card->parent != NULL) lxb_dom_node_remove(card);
+    lxb_dom_node_destroy_deep(card);
+}
+
+static bool browser_engine_commit_media_card(
+    BrowserEngine *engine, lxb_dom_node_t *card,
+    lxb_dom_node_t *wrapped_image)
+{
+    PocDocument *document = &engine->navigation.page.document;
+    NavigationPage *page = &engine->navigation.page;
+    /* Publish exact native provenance before layout observes the new node.
+       The public marker remains useful for diagnostics and authored CSS, but
+       is never an authority boundary. */
+    document->declared_video_card_node = card;
+    bool shell_was_ready = engine->render_ready;
+    bool document_refreshed = document_refresh(document);
+    if (document_refreshed && wrapped_image == NULL) {
+        lxb_dom_node_t *nodes[] = {card};
+        /* Poster refusal is soft: the browser-colored card and play glyph
+           remain useful. A successful exact-node refresh is still charged to
+           the ordinary page image budget and policy pipeline. */
+        if (images_refresh_external_nodes(
+                document, &page->stylesheet, &page->images,
+                nodes, 1u, engine->navigation.budget,
+                page->resource_base_url, page->document_url,
+                page->referrer_policy, engine->navigation.maximum_images,
+                engine->navigation.maximum_image_bytes,
+                engine->navigation.maximum_image_file_bytes,
+                engine->navigation.maximum_decoded_image_bytes,
+                engine->navigation.resource_timeout_ms,
+                page->resource_scheduler,
+                engine->navigation.browser_session)) {
+            engine->navigation.images = &page->images;
+            layout_reuse_cache_update_images(
+                page->layout_reuse, &page->images);
+        }
+    }
+    bool fingerprint_accepted = document_refreshed
+        && navigation_accept_native_resource_fingerprint(
+               &engine->navigation);
+    bool layout_adopted = fingerprint_accepted
+        && navigation_relayout(&engine->navigation);
+    if (!layout_adopted) {
+        lxb_dom_node_t *nodes[] = {card};
+        images_discard_nodes(&page->images, nodes, 1u);
+        layout_reuse_cache_update_images(
+            page->layout_reuse, &page->images);
+        if (document->declared_video_card_node == card)
+            document->declared_video_card_node = NULL;
+        browser_engine_remove_media_card(card, wrapped_image);
+        (void) document_refresh(document);
+        (void) navigation_accept_native_resource_fingerprint(
+            &engine->navigation);
+        (void) navigation_relayout(&engine->navigation);
+        if (shell_was_ready)
+            (void) browser_engine_refresh_render_shell(engine);
+        return false;
+    }
+    if (shell_was_ready && !browser_engine_refresh_render_shell(engine)) {
+        /* The authoritative layout already contains card/node pointers. Never
+           destroy the card and then attempt a fallible replacement layout:
+           under the same pressure that refused the shell that would retain
+           stale DOM pointers. Retire the page as one ownership unit. */
+        engine->declared_media_card = NULL;
+        engine->declared_media_card_generation = 0u;
+        browser_engine_reset_shell(engine);
+        navigation_discard_current_page(&engine->navigation);
+        return false;
+    }
+    if (engine->controller_ready)
+        (void) controller_rebind_focus(&engine->controller);
+    return true;
+}
+
+BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
+    BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded)
+        return BROWSER_DECLARED_MEDIA_CARD_NONE;
+    if (engine->declared_media_card_generation
+            == engine->navigation.generation
+        && engine->navigation.page.document.declared_video_card_node
+               == engine->declared_media_card
+        && browser_engine_media_card_connected(
+               engine, engine->declared_media_card))
+        return BROWSER_DECLARED_MEDIA_CARD_INSTALLED;
+    if (engine->navigation.page.document.declared_video_card_node
+            == engine->declared_media_card) {
+        engine->navigation.page.document.declared_video_card_node = NULL;
+    }
+    engine->declared_media_card = NULL;
+    engine->declared_media_card_generation = 0u;
+    PocDocument *document = &engine->navigation.page.document;
+    if (engine->declared_media_outcome_generation
+            == engine->navigation.generation
+        && engine->declared_media_outcome_content_generation
+               == document->content_generation
+        && (engine->declared_media_outcome
+                == BROWSER_DECLARED_MEDIA_CARD_NONE
+            || engine->declared_media_outcome
+                == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE)) {
+        return engine->declared_media_outcome;
+    }
+    if (!browser_engine_has_script_degradation(&engine->navigation)) {
+        engine->declared_media_recovery_generation = 0u;
+        return BROWSER_DECLARED_MEDIA_CARD_NONE;
+    }
+    if (script_runtime_has_pending_author_work(
+            engine->navigation.page.runtime)) {
+        const uint64_t generation = engine->navigation.generation;
+        const size_t runtime_tick =
+            engine->navigation.page.script_result.runtime_ticks;
+        if (engine->declared_media_recovery_generation != generation) {
+            engine->declared_media_recovery_generation = generation;
+            engine->declared_media_recovery_first_runtime_tick = runtime_tick;
+            /* Basic and media-card recovery inspect the same unsettled page.
+               Let the first observer seed both clocks so an undeclared page
+               does not pay two consecutive settle windows. */
+            if (engine->basic_view_recovery_generation != generation) {
+                engine->basic_view_recovery_generation = generation;
+                engine->basic_view_recovery_first_runtime_tick = runtime_tick;
+            }
+        }
+        size_t first_tick =
+            engine->declared_media_recovery_first_runtime_tick;
+        size_t settled_ticks = runtime_tick >= first_tick
+            ? runtime_tick - first_tick : BROWSER_BLANK_READER_SETTLE_TICKS;
+        if (settled_ticks < BROWSER_BLANK_READER_SETTLE_TICKS)
+            return BROWSER_DECLARED_MEDIA_CARD_DEFERRED;
+    }
+    if (!browser_engine_recovery_wall_settled(engine))
+        return BROWSER_DECLARED_MEDIA_CARD_DEFERRED;
+
+    /* Discovery and resolved-thumbnail walks are deliberately last. During
+       the settle window this function is called once per dirty frame, so
+       even a cached first scan would be wasted work on a page whose author
+       runtime may still recover. */
+    const MediaDeclaredVideo *declared = media_declared_video_cached(
+        &engine->navigation.page.document);
+    if (declared == NULL) {
+        engine->declared_media_outcome_generation =
+            engine->navigation.generation;
+        engine->declared_media_outcome_content_generation =
+            document->content_generation;
+        engine->declared_media_outcome = BROWSER_DECLARED_MEDIA_CARD_NONE;
+        return BROWSER_DECLARED_MEDIA_CARD_NONE;
+    }
+    bool author_video = false;
+    lxb_dom_node_t *anchor = browser_engine_find_declared_media_anchor(
+        engine, declared, &author_video);
+    if (author_video) {
+        engine->declared_media_outcome_generation =
+            engine->navigation.generation;
+        engine->declared_media_outcome_content_generation =
+            document->content_generation;
+        engine->declared_media_outcome = BROWSER_DECLARED_MEDIA_CARD_NONE;
+        return BROWSER_DECLARED_MEDIA_CARD_NONE;
+    }
+
+    lxb_dom_node_t *body = document_body_node(document);
+    if (body == NULL) {
+        engine->declared_media_outcome_generation =
+            engine->navigation.generation;
+        engine->declared_media_outcome_content_generation =
+            document->content_generation;
+        engine->declared_media_outcome = BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE;
+        return BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE;
+    }
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    const char *tag = anchor == NULL ? "video" : "div";
+    lxb_dom_element_t *element = lxb_dom_document_create_element(
+        &document->html->dom_document, (const lxb_char_t *) tag,
+        strlen(tag), NULL);
+    lxb_dom_node_t *card = element == NULL ? NULL
+        : lxb_dom_interface_node(element);
+    bool okay = card != NULL
+        && browser_engine_media_set_attribute(
+               card, "data-tilefinch-declared-media-card",
+               anchor == NULL ? "synthetic" : "thumbnail")
+        && browser_engine_media_set_attribute(card, "role", "button")
+        && browser_engine_media_set_attribute(
+               card, "aria-label",
+               declared->title[0] == '\0'
+                   ? "Play declared video in Tilefinch"
+                   : declared->title)
+        && browser_engine_media_set_attribute(
+               card, "title",
+               declared->title[0] == '\0'
+                   ? "Play video" : declared->title);
+    if (okay && declared->duration[0] != '\0')
+        okay = browser_engine_media_set_attribute(
+            card, "data-tilefinch-media-duration", declared->duration);
+    if (okay && anchor == NULL) {
+        okay = browser_engine_media_set_attribute(card, "controls", "controls")
+            && browser_engine_media_set_attribute(
+                card, "style",
+                "display:block;width:100%;height:135px;max-height:50vh;"
+                "box-sizing:border-box;margin:8px 0;border:2px solid #547696;"
+                "border-radius:8px;background:#162431")
+            && (declared->thumbnail_url[0] == '\0'
+                || browser_engine_media_set_attribute(
+                       card, "poster", declared->thumbnail_url));
+        if (okay) okay = body->first_child == NULL
+            ? lxb_dom_node_append_child(body, card) == LXB_DOM_EXCEPTION_OK
+            : lxb_dom_node_insert_before_spec(
+                  body, card, body->first_child) == LXB_DOM_EXCEPTION_OK;
+    } else if (okay) {
+        lxb_dom_node_t *parent = anchor->parent;
+        okay = parent != NULL
+            && browser_engine_media_set_attribute(
+                card, "style",
+                "display:inline-block;position:relative;max-width:100%;"
+                "box-sizing:border-box;border:2px solid #547696;"
+                "border-radius:8px;background:#162431")
+            && lxb_dom_node_insert_before_spec(parent, card, anchor)
+                   == LXB_DOM_EXCEPTION_OK
+            && lxb_dom_node_append_child(card, anchor)
+                   == LXB_DOM_EXCEPTION_OK;
+    }
+    if (!okay && card != NULL)
+        browser_engine_remove_media_card(card, anchor);
+    document_allocation_owner_leave(document, previous);
+    if (!okay || !browser_engine_commit_media_card(engine, card, anchor)) {
+        /* Allocation, mutation-journal and shell preparation refusals are
+           transient.  Only a document-derived absence (such as no body)
+           may latch UNAVAILABLE for this content generation. */
+        return BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE;
+    }
+    engine->declared_media_card = card;
+    engine->declared_media_card_generation = engine->navigation.generation;
+    engine->declared_media_outcome_generation = engine->navigation.generation;
+    engine->declared_media_outcome_content_generation =
+        document->content_generation;
+    engine->declared_media_outcome = BROWSER_DECLARED_MEDIA_CARD_INSTALLED;
+    return BROWSER_DECLARED_MEDIA_CARD_INSTALLED;
+}
+
+BrowserBlankReaderRecovery browser_engine_prepare_blank_reader_recovery(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || !browser_engine_page_is_visually_blank(engine)
+        || !browser_engine_has_script_degradation(&engine->navigation)) {
+        if (engine != NULL) engine->blank_reader_recovery_generation = 0u;
+        return BROWSER_BLANK_READER_RECOVERY_NONE;
+    }
+    if (script_runtime_has_pending_author_work(
+            engine->navigation.page.runtime)) {
+        const uint64_t generation = engine->navigation.generation;
+        const size_t runtime_tick =
+            engine->navigation.page.script_result.runtime_ticks;
+        if (engine->blank_reader_recovery_generation != generation) {
+            engine->blank_reader_recovery_generation = generation;
+            engine->blank_reader_recovery_first_runtime_tick = runtime_tick;
+        }
+        const size_t first_tick =
+            engine->blank_reader_recovery_first_runtime_tick;
+        const size_t settled_ticks = runtime_tick >= first_tick
+            ? runtime_tick - first_tick : BROWSER_BLANK_READER_SETTLE_TICKS;
+        /* Give delayed hydration an ordinary bounded settle window. A
+           permanent interval or self-scheduling animation must not suppress
+           both semantic recovery and the native recovery surface forever. */
+        if (settled_ticks < BROWSER_BLANK_READER_SETTLE_TICKS)
+            return BROWSER_BLANK_READER_RECOVERY_DEFERRED;
+    }
+    /* Runtime ticks and elapsed wall time are independent settle evidence;
+       accumulate them concurrently rather than making a recurring page wait
+       one complete window and only then begin the other. */
+    if (!browser_engine_recovery_wall_settled(engine))
+        return BROWSER_BLANK_READER_RECOVERY_DEFERRED;
+    engine->blank_reader_recovery_generation = 0u;
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (!stored->prepared
+        && !script_runtime_node_handle_capacity_available(
+               engine->navigation.page.runtime)) {
+        if (analysis != NULL) {
+            *analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+        }
+        return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+    }
+    if (!stored->prepared
+        && !reader_document_prepare_complete_with_stylesheet(
+               &engine->navigation.page.document,
+               &engine->navigation.page.stylesheet, stored)) {
+        return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+    }
+    ReaderDocumentAnalysis prepared = *stored;
+    if (prepared.bounded_out || prepared.extraction_truncated) {
+        if (analysis != NULL) *analysis = prepared;
+        /* Strict automatic recovery deliberately installed no tree. Do not
+           let that analysis-only result suppress a later explicit Reader
+           request, whose bounded/truncated presentation is still useful and
+           visibly labeled as shortened. */
+        *stored = (ReaderDocumentAnalysis) {0};
+        return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+    }
+    lxb_dom_node_t *reader_root = prepared.kind == READER_PAGE_RAW
+        ? NULL : browser_engine_establish_reader_root(
+              &engine->navigation.page, prepared.kind);
+    bool available = reader_root != NULL;
+    if (prepared.kind != READER_PAGE_RAW && reader_root == NULL) {
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, prepared.kind);
+        *stored = (ReaderDocumentAnalysis) {0};
+    }
+    if (reader_root != NULL) {
+        browser_engine_alias_reader_images(
+            engine, &engine->navigation, reader_root,
+            BROWSER_READER_ALIAS_PREPARE);
+    }
+    if (analysis != NULL) *analysis = prepared;
+    return available ? BROWSER_BLANK_READER_RECOVERY_AVAILABLE
+                     : BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+}
+
+static bool browser_engine_has_visible_action_target(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    for (size_t i = 0; i < layout->link_count; i++) {
+        const LinkRegion *link = &layout->links[i];
+        if (link->node != NULL && link->width > 0 && link->height > 0)
+            return true;
+    }
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *control = &layout->controls[i];
+        if (control->node != NULL
+            && control->width > 0 && control->height > 0) return true;
+    }
+    return false;
+}
+
+BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || !browser_engine_has_script_degradation(&engine->navigation)
+        || (!browser_engine_page_is_visually_blank(engine)
+            && browser_engine_has_visible_action_target(engine))) {
+        if (engine != NULL) engine->basic_view_recovery_generation = 0u;
+        return BROWSER_BASIC_VIEW_RECOVERY_NONE;
+    }
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (stored->prepared && stored->kind == READER_PAGE_BASIC) {
+        lxb_dom_node_t *root = browser_engine_resolve_reader_root(
+            &engine->navigation.page, READER_PAGE_BASIC);
+        if (analysis != NULL) *analysis = *stored;
+        return root == NULL
+            ? BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE
+            : BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE;
+    }
+    if (stored->prepared && stored->kind != READER_PAGE_RAW) {
+        if (analysis != NULL) *analysis = *stored;
+        return BROWSER_BASIC_VIEW_RECOVERY_NONE;
+    }
+    if (script_runtime_has_pending_author_work(
+            engine->navigation.page.runtime)) {
+        const uint64_t generation = engine->navigation.generation;
+        const size_t runtime_tick =
+            engine->navigation.page.script_result.runtime_ticks;
+        if (engine->basic_view_recovery_generation != generation) {
+            engine->basic_view_recovery_generation = generation;
+            engine->basic_view_recovery_first_runtime_tick = runtime_tick;
+        }
+        size_t first_tick =
+            engine->basic_view_recovery_first_runtime_tick;
+        size_t settled_ticks = runtime_tick >= first_tick
+            ? runtime_tick - first_tick : BROWSER_BLANK_READER_SETTLE_TICKS;
+        if (settled_ticks < BROWSER_BLANK_READER_SETTLE_TICKS)
+            return BROWSER_BASIC_VIEW_RECOVERY_DEFERRED;
+    }
+    if (!browser_engine_recovery_wall_settled(engine))
+        return BROWSER_BASIC_VIEW_RECOVERY_DEFERRED;
+    engine->basic_view_recovery_generation = 0u;
+    if (!script_runtime_node_handle_capacity_available(
+            engine->navigation.page.runtime)) {
+        if (analysis != NULL) {
+            *analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+        }
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    ReaderDocumentAnalysis prepared = {0};
+    if (!reader_document_prepare_basic_complete_with_stylesheet(
+            &engine->navigation.page.document,
+            &engine->navigation.page.stylesheet, &prepared)) {
+        if (analysis != NULL) *analysis = prepared;
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    if (analysis != NULL) *analysis = prepared;
+    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out
+        || prepared.extraction_truncated) {
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    lxb_dom_node_t *root = browser_engine_establish_reader_root(
+        &engine->navigation.page, READER_PAGE_BASIC);
+    if (root == NULL) {
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, READER_PAGE_BASIC);
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    *stored = prepared;
+    browser_engine_alias_reader_images(
+        engine, &engine->navigation, root,
+        BROWSER_READER_ALIAS_PREPARE);
+    return BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE;
+}
+
+void browser_engine_set_reader_candidate_mode(BrowserEngine *engine,
+                                              bool enabled)
+{
+    if (engine != NULL && engine->navigation_ready)
+        navigation_set_reader_candidate_mode(&engine->navigation, enabled);
+}
+
+bool browser_engine_reader_analysis(
+    const BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (engine == NULL || analysis == NULL
+        || !engine->navigation.page.reader_analysis.prepared) return false;
+    *analysis = engine->navigation.page.reader_analysis;
+    return true;
+}
+
+const NavigationSession *browser_engine_navigation_view(
+    const BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+            || !engine->navigation_ready
+        ? NULL : &engine->navigation;
+}
+
+const BrowserController *browser_engine_controller_view(
+    const BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+            || !engine->controller_ready
+        ? NULL : &engine->controller;
+}
+
+const FontFace *browser_engine_font_face(
+    const BrowserEngine *engine, FontFamily family)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+            || !engine->fonts_ready
+        ? NULL : font_set_face(&engine->fonts, family);
+}
+
+const FontFace *browser_engine_font_face_variant(
+    const BrowserEngine *engine, FontFamily family, bool italic, bool bold)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+            || !engine->fonts_ready
+        ? NULL : font_set_face_variant(
+            &engine->fonts, family, italic, bold);
+}
+
+const TileCache *browser_engine_render_metrics_view(
+    const BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+            || !engine->render_ready
+        ? NULL : &engine->render;
+}
+
+Budget *browser_engine_budget(BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        ? NULL : &engine->budget;
+}
+
+BrowserSession *browser_engine_session(BrowserEngine *engine)
+{
+    return engine == NULL || !engine->session_ready ? NULL : &engine->session;
+}
+
+const BrowserSession *browser_engine_session_view(const BrowserEngine *engine)
+{
+    return engine == NULL || !engine->session_ready ? NULL : &engine->session;
+}
+
+NavigationSession *browser_engine_navigation(BrowserEngine *engine)
+{
+    return engine == NULL || !engine->navigation_ready
+        ? NULL : &engine->navigation;
+}
+
+BrowserController *browser_engine_controller(BrowserEngine *engine)
+{
+    return engine == NULL || !engine->controller_ready
+        ? NULL : &engine->controller;
+}
+
+FontSet *browser_engine_fonts(BrowserEngine *engine)
+{
+    return engine == NULL || !engine->fonts_ready ? NULL : &engine->fonts;
+}
+
+TileCache *browser_engine_render_shell(BrowserEngine *engine)
+{
+    return engine == NULL || !engine->render_ready ? NULL : &engine->render;
+}
+
+uint16_t *browser_engine_framebuffer(BrowserEngine *engine,
+                                     size_t *pixel_count)
+{
+    if (pixel_count != NULL)
+        *pixel_count = engine == NULL ? 0 : engine->framebuffer_pixels;
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        ? NULL : engine->framebuffer;
+}

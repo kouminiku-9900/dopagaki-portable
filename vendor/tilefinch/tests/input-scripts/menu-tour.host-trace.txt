@@ -1,0 +1,40 @@
+script menu-tour.txt steps=93
+mark boot screen=home
+mark home-first screen=home
+mark tabs-first screen=tabs
+step=12 action=new-tab setting=none screen=home menu=1 option=0 group=0 tab=0
+mark home-tab screen=home
+step=17 action=show-offline setting=none screen=collections menu=3 option=0 group=0 tab=0
+mark library screen=collections
+step=20 action=show-bookmarks setting=none screen=collections menu=3 option=0 group=0 tab=0
+step=20 action=show-history setting=none screen=collections menu=3 option=0 group=0 tab=0
+step=20 action=show-downloads setting=none screen=collections menu=3 option=0 group=0 tab=0
+step=20 action=show-screenshots setting=none screen=collections menu=3 option=0 group=0 tab=0
+mark screenshots screen=collections
+step=23 action=collection-activate setting=none screen=page menu=3 option=0 group=0 tab=0
+mark page screen=page
+step=26 action=focus-down setting=none screen=page menu=3 option=0 group=0 tab=0
+step=27 action=focus-right setting=none screen=page menu=3 option=0 group=0 tab=0
+step=28 action=page-down setting=none screen=page menu=3 option=0 group=0 tab=0
+step=29 action=page-up setting=none screen=page menu=3 option=0 group=0 tab=0
+mark scrolled screen=page
+step=32 action=reload setting=none screen=page menu=3 option=0 group=0 tab=0
+mark reloaded screen=page
+step=39 action=toggle-reader setting=none screen=page menu=2 option=0 group=0 tab=0
+mark reader screen=page
+step=45 action=toggle-reader setting=none screen=page menu=2 option=0 group=0 tab=0
+mark reader-off screen=page
+step=54 action=toggle-reader-site setting=none screen=site-controls menu=3 option=0 group=0 tab=0
+mark reader-site screen=site-controls
+mark appearance screen=option-items
+step=64 action=none setting=browser-ui-scale screen=option-items menu=4 option=0 group=0 tab=0
+step=66 action=none setting=page-font-percent screen=option-items menu=4 option=1 group=0 tab=0
+step=68 action=none setting=reader-font screen=option-items menu=4 option=2 group=0 tab=0
+mark appearance-done screen=menu
+mark help screen=help
+step=81 action=home setting=none screen=home menu=0 option=2 group=0 tab=0
+mark home screen=home
+mark home-moved screen=home
+step=89 action=exit setting=none screen=home menu=6 option=2 group=0 tab=0
+mark exiting screen=home
+outcome complete frames=396 steps=92/93

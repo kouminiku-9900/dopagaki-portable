@@ -1,0 +1,75 @@
+komi-tube memprobe v1 variant=m0
+log: ms0:/PSP/GAME/KOMI_PROBE_M0/memprobe-m0.txt
+==== run begin version=1 variant=m0
+device devkit=0x06060110 model=8
+image main=0x08804AE4 stack=0x09FBFDB8 newlib_block=0x0882DCB0
+mem label=boot total_free=23663872 max_free=23405824
+map label=boot start=0x0892DB00 end=0x09F80000 size=23405824 side=below
+map label=boot start=0x09FC0000 end=0x09FFF000 size=258048 side=below
+map-total label=boot ranges=2 free_below=23663872 free_above=0
+loading AV / net modules...
+module name=avcodec status=0x00000000
+mem label=after-avcodec total_free=23663872 max_free=23405824
+module name=mpeg_vsh load=0x03EF3E51 start=0x03EF3E51 module_status=0x00000000
+mem label=after-mpeg-vsh total_free=23619584 max_free=23361536
+module name=net-common status=0x00000000
+module name=net-inet status=0x00000000
+mem label=after-net-modules total_free=23177216 max_free=22919168
+net stage=sceNetInit status=0x00000000
+net stage=sceNetInetInit status=0x00000000
+net stage=sceNetResolverInit status=0x00000000
+net stage=sceNetApctlInit status=0x00000000
+mem label=after-net-init total_free=23005184 max_free=22788096
+map label=after-modules start=0x089C4800 end=0x09F80000 size=22788096 side=below
+map label=after-modules start=0x09FC0000 end=0x09FF5000 size=217088 side=below
+map-total label=after-modules ranges=2 free_below=23005184 free_above=0
+reserving ME region + arena...
+me-candidate addr=0x08800000 uid=0x800200D9 head=0x00000000
+me-candidate addr=0x08C00000 uid=0x04832403 head=0x08C00000
+me-region mode=aligned uid=0x04832403 start=0x08C00000 end=0x09200000 size=6291456 side=below
+arena uid=0x04842B27 start=0x09300000 end=0x09F80000 size=13107200 above_limit=0 side=below
+mem label=after-layout total_free=3606528 max_free=2340864
+map label=after-layout start=0x089C4800 end=0x08C00000 size=2340864 side=below
+map label=after-layout start=0x09200000 end=0x09300000 size=1048576 side=below
+map label=after-layout start=0x09FC0000 end=0x09FF5000 size=217088 side=below
+map-total label=after-layout ranges=3 free_below=3606528 free_above=0
+Media Engine visibility test (AAC)...
+ME test: low memory...
+codec-begin label=me-region ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=me-region stage=CheckNeedMem status=0x00000000 need=100744
+10 codec cycles...
+codec-begin label=cycle-1 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-1 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-2 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-2 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-3 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-3 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-4 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-4 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-5 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-5 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-6 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-6 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-7 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-7 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-8 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-8 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-9 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-9 stage=CheckNeedMem status=0x00000000 need=100744
+codec-begin label=cycle-10 ctrl=0x091F0000 edram=0x091F0400 input=0x091F8400 pcm=0x091FA400
+codec-fail label=cycle-10 stage=CheckNeedMem status=0x00000000 need=100744
+cycles ok=0/10 free_before=3606528 free_after=3606528
+volatile lock=0x00000000 ptr=0x08400000 size=4194304
+ME test: volatile memory...
+codec-begin label=volatile ctrl=0x08400000 edram=0x08400400 input=0x08408400 pcm=0x0840A400
+codec-fail label=volatile stage=CheckNeedMem status=0x00000000 need=100744
+codec-skip label=arena-high reason=no-high-memory
+
+SUMMARY variant=m0 model=8
+SUMMARY me_region=0x08C00000-0x09200000 mode=aligned below_limit=yes
+SUMMARY arena=0x09300000-0x09F80000 size=12800KB above_limit=0KB
+SUMMARY me_read low=FAIL volatile=FAIL mixed_io_high=n/a high=n/a
+SUMMARY cycles=0/10 leak=0
+==== run end
+
+Done. Saved to memory stick. Press X / O / START (auto exit 30 s).

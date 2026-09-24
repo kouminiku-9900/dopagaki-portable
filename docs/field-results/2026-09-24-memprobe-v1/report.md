@@ -1,0 +1,116 @@
+# memprobe report
+
+## memprobe-m0.txt (variant m0)
+
+- devkit 0x06060110, kuKernelGetModel 8
+- free `boot`: total 22.57 MB, largest 22.32 MB
+- free `after-avcodec`: total 22.57 MB, largest 22.32 MB
+- free `after-mpeg-vsh`: total 22.53 MB, largest 22.28 MB
+- free `after-net-modules`: total 22.10 MB, largest 21.86 MB
+- free `after-net-init`: total 21.94 MB, largest 21.73 MB
+- free `after-layout`: total 3.44 MB, largest 2.23 MB
+- free map `boot`: 2 ranges, below 0x0A000000 22.57 MB, above 0.00 MB
+  - 0x0892DB00-0x09F80000 (22.32 MB)
+  - 0x09FC0000-0x09FFF000 (0.25 MB)
+- free map `after-modules`: 2 ranges, below 0x0A000000 21.94 MB, above 0.00 MB
+  - 0x089C4800-0x09F80000 (21.73 MB)
+  - 0x09FC0000-0x09FF5000 (0.21 MB)
+- free map `after-layout`: 3 ranges, below 0x0A000000 3.44 MB, above 0.00 MB
+  - 0x089C4800-0x08C00000 (2.23 MB)
+  - 0x09200000-0x09300000 (1.00 MB)
+  - 0x09FC0000-0x09FF5000 (0.21 MB)
+- ME region: 0x08C00000-0x09200000 (6.00 MB, aligned, below the limit)
+- arena: 0x09300000-0x09F80000 (12.50 MB, 0.00 MB above the limit)
+- volatile memory lock 0x00000000 at 0x08400000 size 4194304
+- Media Engine reads (AAC decode):
+  - me-region: FAIL at CheckNeedMem (0x00000000)
+  - volatile: FAIL at CheckNeedMem (0x00000000)
+  - mixed-io-high: not run
+  - arena-high: not run
+- 10 codec cycles: 0/10, partition change 0 bytes
+- module / net init statuses:
+  - `module name=avcodec status=0x00000000`
+  - `module name=mpeg_vsh load=0x03EF3E51 start=0x03EF3E51 module_status=0x00000000`
+  - `module name=net-common status=0x00000000`
+  - `module name=net-inet status=0x00000000`
+  - `net stage=sceNetInit status=0x00000000`
+  - `net stage=sceNetInetInit status=0x00000000`
+  - `net stage=sceNetResolverInit status=0x00000000`
+  - `net stage=sceNetApctlInit status=0x00000000`
+
+## memprobe-m1.txt (variant m1)
+
+- devkit 0x06060110, kuKernelGetModel 8
+- free `boot`: total 49.57 MB, largest 49.32 MB
+- free `after-avcodec`: total 49.57 MB, largest 49.32 MB
+- free `after-mpeg-vsh`: total 49.53 MB, largest 49.28 MB
+- free `after-net-modules`: total 49.10 MB, largest 48.86 MB
+- free `after-net-init`: total 48.94 MB, largest 48.73 MB
+- free `after-layout`: total 3.44 MB, largest 2.23 MB
+- free map `boot`: 2 ranges, below 0x0A000000 22.82 MB, above 26.75 MB
+  - 0x0892DB00-0x0BA80000 (49.32 MB)
+  - 0x0BAC0000-0x0BAFF000 (0.25 MB)
+- free map `after-modules`: 2 ranges, below 0x0A000000 22.23 MB, above 26.71 MB
+  - 0x089C4800-0x0BA80000 (48.73 MB)
+  - 0x0BAC0000-0x0BAF5000 (0.21 MB)
+- free map `after-layout`: 3 ranges, below 0x0A000000 3.23 MB, above 0.21 MB
+  - 0x089C4800-0x08C00000 (2.23 MB)
+  - 0x09200000-0x09300000 (1.00 MB)
+  - 0x0BAC0000-0x0BAF5000 (0.21 MB)
+- ME region: 0x08C00000-0x09200000 (6.00 MB, aligned, below the limit)
+- arena: 0x09300000-0x0BA80000 (39.50 MB, 26.50 MB above the limit)
+- volatile memory lock 0x00000000 at 0x08400000 size 4194304
+- Media Engine reads (AAC decode):
+  - me-region: FAIL at CheckNeedMem (0x00000000)
+  - volatile: FAIL at CheckNeedMem (0x00000000)
+  - mixed-io-high: FAIL at CheckNeedMem (0x00000000)
+  - arena-high: FAIL at CheckNeedMem (0x00000000)
+- 10 codec cycles: 0/10, partition change 0 bytes
+- module / net init statuses:
+  - `module name=avcodec status=0x00000000`
+  - `module name=mpeg_vsh load=0x03ED2F57 start=0x03ED2F57 module_status=0x00000000`
+  - `module name=net-common status=0x00000000`
+  - `module name=net-inet status=0x00000000`
+  - `net stage=sceNetInit status=0x00000000`
+  - `net stage=sceNetInetInit status=0x00000000`
+  - `net stage=sceNetResolverInit status=0x00000000`
+  - `net stage=sceNetApctlInit status=0x00000000`
+
+## memprobe-m2.txt (variant m2)
+
+- devkit 0x06060110, kuKernelGetModel 8
+- free `boot`: total 22.57 MB, largest 22.32 MB
+- free `after-avcodec`: total 22.57 MB, largest 22.32 MB
+- free `after-mpeg-vsh`: total 22.53 MB, largest 22.28 MB
+- free `after-net-modules`: total 22.10 MB, largest 21.86 MB
+- free `after-net-init`: total 21.94 MB, largest 21.73 MB
+- free `after-layout`: total 3.44 MB, largest 2.23 MB
+- free map `boot`: 2 ranges, below 0x0A000000 22.57 MB, above 0.00 MB
+  - 0x0892DB00-0x09F80000 (22.32 MB)
+  - 0x09FC0000-0x09FFF000 (0.25 MB)
+- free map `after-modules`: 2 ranges, below 0x0A000000 21.94 MB, above 0.00 MB
+  - 0x089C4800-0x09F80000 (21.73 MB)
+  - 0x09FC0000-0x09FF5000 (0.21 MB)
+- free map `after-layout`: 3 ranges, below 0x0A000000 3.44 MB, above 0.00 MB
+  - 0x089C4800-0x08C00000 (2.23 MB)
+  - 0x09200000-0x09300000 (1.00 MB)
+  - 0x09FC0000-0x09FF5000 (0.21 MB)
+- ME region: 0x08C00000-0x09200000 (6.00 MB, aligned, below the limit)
+- arena: 0x09300000-0x09F80000 (12.50 MB, 0.00 MB above the limit)
+- volatile memory lock 0x00000000 at 0x08400000 size 4194304
+- Media Engine reads (AAC decode):
+  - me-region: FAIL at CheckNeedMem (0x00000000)
+  - volatile: FAIL at CheckNeedMem (0x00000000)
+  - mixed-io-high: not run
+  - arena-high: not run
+- 10 codec cycles: 0/10, partition change 0 bytes
+- module / net init statuses:
+  - `module name=avcodec status=0x00000000`
+  - `module name=mpeg_vsh load=0x03EC2355 start=0x03EC2355 module_status=0x00000000`
+  - `module name=net-common status=0x00000000`
+  - `module name=net-inet status=0x00000000`
+  - `net stage=sceNetInit status=0x00000000`
+  - `net stage=sceNetInetInit status=0x00000000`
+  - `net stage=sceNetResolverInit status=0x00000000`
+  - `net stage=sceNetApctlInit status=0x00000000`
+

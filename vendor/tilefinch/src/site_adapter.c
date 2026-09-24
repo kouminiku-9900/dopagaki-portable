@@ -1,0 +1,815 @@
+#include "tilefinch/site_adapter.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+
+#include "tilefinch/youtube_lite.h"
+
+typedef struct SiteAdapterDefinition SiteAdapterDefinition;
+
+typedef void *(*SiteAdapterBeginCallback)(
+    Budget *budget, BrowserSession *session, const char *url,
+    const SiteAdapterPreferences *preferences,
+    size_t maximum_source_bytes, long timeout_ms,
+    char *error, size_t error_size);
+typedef SiteAdapterLoadStatus (*SiteAdapterPumpCallback)(
+    void *implementation, const FetchPumpQuota *quota);
+typedef SiteAdapterLoadStatus (*SiteAdapterStatusCallback)(
+    const void *implementation);
+typedef void (*SiteAdapterCancelCallback)(
+    void *implementation, const char *reason);
+typedef bool (*SiteAdapterTakeCallback)(
+    void *implementation, SiteAdapterDocument *document);
+typedef bool (*SiteAdapterMetricsCallback)(
+    const void *implementation, SiteAdapterLoadMetrics *metrics);
+typedef const char *(*SiteAdapterErrorCallback)(const void *implementation);
+typedef void (*SiteAdapterDestroyCallback)(void *implementation);
+
+struct SiteAdapterDefinition {
+    const char *name;
+    bool requires_network;
+    bool (*matches)(const char *url);
+    bool (*requires_stable_typography)(const char *url);
+    SiteAdapterBeginCallback begin;
+    SiteAdapterPumpCallback pump;
+    SiteAdapterStatusCallback status;
+    SiteAdapterCancelCallback cancel;
+    SiteAdapterTakeCallback take;
+    SiteAdapterMetricsCallback metrics;
+    SiteAdapterErrorCallback error;
+    SiteAdapterDestroyCallback destroy;
+};
+
+struct SiteAdapterLoad {
+    Budget *budget;
+    const SiteAdapterDefinition *definition;
+    void *implementation;
+};
+
+static bool youtube_matches(const char *url)
+{
+    return youtube_lite_route(url) != YOUTUBE_LITE_ROUTE_NONE;
+}
+
+static bool youtube_requires_stable_typography(const char *url)
+{
+    YoutubeLiteRoute route = youtube_lite_route(url);
+    return route != YOUTUBE_LITE_ROUTE_NONE
+        && route != YOUTUBE_LITE_ROUTE_HOME;
+}
+
+static void *youtube_begin(
+    Budget *budget, BrowserSession *session, const char *url,
+    const SiteAdapterPreferences *preferences,
+    size_t maximum_source_bytes, long timeout_ms,
+    char *error, size_t error_size)
+{
+    return youtube_lite_load_begin_configured(
+        budget, session, url,
+        preferences != NULL && preferences->youtube_compact_results,
+        maximum_source_bytes, timeout_ms,
+        error, error_size);
+}
+
+static SiteAdapterLoadStatus youtube_pump(
+    void *implementation, const FetchPumpQuota *quota)
+{
+    YoutubeLiteLoadStatus status = youtube_lite_load_pump(
+        implementation, quota);
+    switch (status) {
+    case YOUTUBE_LITE_LOAD_PENDING:
+        return SITE_ADAPTER_LOAD_PENDING;
+    case YOUTUBE_LITE_LOAD_SUCCEEDED:
+        return SITE_ADAPTER_LOAD_SUCCEEDED;
+    case YOUTUBE_LITE_LOAD_CANCELLED:
+        return SITE_ADAPTER_LOAD_CANCELLED;
+    case YOUTUBE_LITE_LOAD_FAILED:
+    default:
+        return SITE_ADAPTER_LOAD_FAILED;
+    }
+}
+
+static SiteAdapterLoadStatus youtube_status(const void *implementation)
+{
+    YoutubeLiteLoadStatus status = youtube_lite_load_status(implementation);
+    switch (status) {
+    case YOUTUBE_LITE_LOAD_PENDING:
+        return SITE_ADAPTER_LOAD_PENDING;
+    case YOUTUBE_LITE_LOAD_SUCCEEDED:
+        return SITE_ADAPTER_LOAD_SUCCEEDED;
+    case YOUTUBE_LITE_LOAD_CANCELLED:
+        return SITE_ADAPTER_LOAD_CANCELLED;
+    case YOUTUBE_LITE_LOAD_FAILED:
+    default:
+        return SITE_ADAPTER_LOAD_FAILED;
+    }
+}
+
+static void youtube_cancel(void *implementation, const char *reason)
+{
+    youtube_lite_load_cancel(implementation, reason);
+}
+
+static bool youtube_take(
+    void *implementation, SiteAdapterDocument *document)
+{
+    if (document == NULL) return false;
+    YoutubeLiteDocument youtube = {0};
+    if (!youtube_lite_load_take_document(implementation, &youtube))
+        return false;
+    *document = (SiteAdapterDocument) {
+        .budget = youtube.budget,
+        .html = youtube.html,
+        .html_length = youtube.html_length,
+        .source_bytes = youtube.source_bytes,
+        .result_count = youtube.result_count,
+        .status_code = youtube.status_code
+    };
+    snprintf(document->adapter, sizeof(document->adapter), "%s",
+             "youtube-lite");
+    snprintf(document->server, sizeof(document->server), "%s",
+             youtube.server);
+    snprintf(document->cf_mitigated, sizeof(document->cf_mitigated), "%s",
+             youtube.cf_mitigated);
+    youtube.html = NULL;
+    youtube_lite_document_destroy(&youtube);
+    return true;
+}
+
+static bool youtube_metrics(
+    const void *implementation, SiteAdapterLoadMetrics *metrics)
+{
+    if (metrics == NULL) return false;
+    YoutubeLiteLoadMetrics youtube = {0};
+    if (!youtube_lite_load_metrics(implementation, &youtube)) return false;
+    *metrics = (SiteAdapterLoadMetrics) {
+        .pump_calls = youtube.pump_calls,
+        .network_pumps = youtube.network_pumps,
+        .completion_per_mille = youtube.completion_per_mille,
+        .body_bytes = youtube.body_bytes,
+        .body_callbacks = youtube.body_callbacks,
+        .peak_buffered_bytes = youtube.peak_buffered_bytes,
+        .quota_yields = youtube.quota_yields,
+        .requests_started = youtube.requests_started,
+        .requests_completed = youtube.requests_completed,
+        .document_cache_hits = youtube.document_cache_hits,
+        .document_cache_stores = youtube.document_cache_stores,
+        .transport_samples = youtube.transport_samples,
+        .reused_connections = youtube.reused_connections,
+        .build_slices = youtube.build_slices,
+        .transform_quota_overruns =
+            youtube.transform_quota_overruns,
+        .network_us = youtube.network_us,
+        .build_us = youtube.build_us,
+        .request_wall_us = youtube.request_wall_us,
+        .transport_total_us = youtube.transport_total_us,
+        .dns_us = youtube.dns_us,
+        .tcp_us = youtube.tcp_us,
+        .tls_us = youtube.tls_us,
+        .server_us = youtube.server_us,
+        .body_transfer_us = youtube.body_transfer_us,
+        .admission_collect_us = youtube.admission_collect_us,
+        .maximum_pump_us = youtube.maximum_pump_us,
+        .maximum_transform_slice_us =
+            youtube.maximum_transform_slice_us,
+        .maximum_irreducible_unit_us =
+            youtube.maximum_irreducible_unit_us
+    };
+    return true;
+}
+
+static const char *youtube_error(const void *implementation)
+{
+    return youtube_lite_load_error(implementation);
+}
+
+static void youtube_destroy(void *implementation)
+{
+    youtube_lite_load_destroy(implementation);
+}
+
+typedef struct {
+    Budget *budget;
+    SiteAdapterDocument document;
+    SiteAdapterLoadStatus status;
+    char error[96];
+} GoogleSearchCompatibilityLoad;
+
+static bool google_search_query(
+    const char *url, const char **query, size_t *query_length)
+{
+    if (query != NULL) *query = NULL;
+    if (query_length != NULL) *query_length = 0u;
+    if (url == NULL || query == NULL || query_length == NULL) return false;
+    static const char www_prefix[] = "https://www.google.com/search?";
+    static const char bare_prefix[] = "https://google.com/search?";
+    const char *at = NULL;
+    if (strncasecmp(url, www_prefix, sizeof(www_prefix) - 1u) == 0)
+        at = url + sizeof(www_prefix) - 1u;
+    else if (strncasecmp(url, bare_prefix, sizeof(bare_prefix) - 1u) == 0)
+        at = url + sizeof(bare_prefix) - 1u;
+    else return false;
+    size_t left = strcspn(at, "#");
+    bool raw = false;
+    while (left != 0u) {
+        size_t span = 0u;
+        while (span < left && at[span] != '&') span++;
+        const char *equals = memchr(at, '=', span);
+        size_t name_length = equals == NULL
+            ? span : (size_t) (equals - at);
+        size_t value_length = equals == NULL
+            ? 0u : span - name_length - 1u;
+        const char *value = equals == NULL ? at + span : equals + 1;
+        if (name_length == sizeof("tilefinch_raw") - 1u
+            && memcmp(at, "tilefinch_raw", name_length) == 0
+            && value_length == 1u && value[0] == '1') raw = true;
+        if (name_length == 1u && at[0] == 'q' && value_length != 0u
+            && *query == NULL) {
+            *query = value;
+            *query_length = value_length;
+        }
+        if (span == left) break;
+        at += span + 1u;
+        left -= span + 1u;
+    }
+    return !raw && *query != NULL && *query_length <= 384u;
+}
+
+static bool google_search_matches(const char *url)
+{
+    const char *query = NULL;
+    size_t query_length = 0u;
+    return google_search_query(url, &query, &query_length);
+}
+
+static int google_hex(unsigned char byte)
+{
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    return -1;
+}
+
+static bool google_query_html(
+    const char *query, size_t query_length, char *output, size_t capacity)
+{
+    size_t used = 0u;
+    for (size_t at = 0u; at < query_length; at++) {
+        unsigned char byte = (unsigned char) query[at];
+        if (byte == '+') byte = ' ';
+        else if (byte == '%' && at + 2u < query_length) {
+            int high = google_hex((unsigned char) query[at + 1u]);
+            int low = google_hex((unsigned char) query[at + 2u]);
+            if (high >= 0 && low >= 0) {
+                byte = (unsigned char) ((high << 4) | low);
+                at += 2u;
+            }
+        }
+        const char *entity = NULL;
+        if (byte == '&') entity = "&amp;";
+        else if (byte == '<') entity = "&lt;";
+        else if (byte == '>') entity = "&gt;";
+        else if (byte == '"') entity = "&quot;";
+        else if (byte == '\'') entity = "&#39;";
+        if (entity != NULL) {
+            size_t length = strlen(entity);
+            if (length >= capacity - used) return false;
+            memcpy(output + used, entity, length);
+            used += length;
+        } else {
+            if (used + 1u >= capacity) return false;
+            output[used++] = byte == 0u ? ' ' : (char) byte;
+        }
+    }
+    output[used] = '\0';
+    return true;
+}
+
+static void *google_search_begin(
+    Budget *budget, BrowserSession *session, const char *url,
+    const SiteAdapterPreferences *preferences,
+    size_t maximum_source_bytes, long timeout_ms,
+    char *error, size_t error_size)
+{
+    (void) session; (void) preferences; (void) maximum_source_bytes;
+    (void) timeout_ms;
+    const char *query = NULL;
+    size_t query_length = 0u;
+    if (!google_search_query(url, &query, &query_length)) return NULL;
+    GoogleSearchCompatibilityLoad *load = budget_calloc_category(
+        budget, BUDGET_CATEGORY_RESOURCE, 1u, sizeof(*load));
+    if (load == NULL) {
+        if (error != NULL && error_size != 0u)
+            snprintf(error, error_size, "%s",
+                     "Google compatibility page exceeded its memory bound");
+        return NULL;
+    }
+    load->budget = budget;
+    /* Two escaped copies are embedded in the bounded document. 384 encoded
+       bytes can expand to at most 2304 HTML-entity bytes per copy. */
+    char display[2305];
+    if (!google_query_html(query, query_length, display, sizeof(display))) {
+        snprintf(load->error, sizeof(load->error), "%s",
+                 "Google query exceeded compatibility bounds");
+        load->status = SITE_ADAPTER_LOAD_FAILED;
+        return load;
+    }
+    size_t capacity = 7168u;
+    char *html = budget_malloc_category(
+        budget, BUDGET_CATEGORY_RESOURCE, capacity);
+    if (html == NULL) {
+        budget_free(budget, load);
+        if (error != NULL && error_size != 0u)
+            snprintf(error, error_size, "%s",
+                     "Google compatibility page exceeded its memory bound");
+        return NULL;
+    }
+    int length = snprintf(
+        html, capacity,
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width'>"
+        "<title>Web search</title><style>"
+        "html{background:#07131d;color:#eef6ff;font:16px sans-serif}"
+        "body{margin:0;padding:18px;max-width:440px}h1{font-size:24px;"
+        "margin:0 0 10px;color:#78bfff}p{line-height:1.35}"
+        "form{margin:16px 0}input{box-sizing:border-box;width:100%%;"
+        "padding:9px;border:1px solid #4d799d;background:#10283a;"
+        "color:#fff}button,a{display:block;box-sizing:border-box;"
+        "margin-top:9px;padding:10px;border:1px solid #5f9dcc;"
+        "background:#173a54;color:#fff;text-decoration:none}"
+        "small{display:block;color:#a7bdcf;margin-top:14px}"
+        "</style></head><body><main><h1>Google needs JavaScript</h1>"
+        "<p>Google no longer sends search results in its basic HTML response."
+        " Tilefinch can open a script-light search instead.</p>"
+        "<form action='https://lite.duckduckgo.com/lite/' method=get>"
+        "<input id=compat-query name=q value=\"%s\" aria-label='Search query'>"
+        "<button id=compat-search type=submit autofocus>"
+        "Search with DuckDuckGo</button></form>"
+        "<form action='https://www.google.com/search' method=get>"
+        "<input type=hidden name=q value=\"%s\">"
+        "<input type=hidden name=tilefinch_raw value=1>"
+        "<button id=compat-google type=submit>Try Google anyway</button></form>"
+        "<small>Your query is sent to DuckDuckGo only after you choose the"
+        " first action.</small></main></body></html>", display, display);
+    if (length < 0 || (size_t) length >= capacity) {
+        budget_free(budget, html);
+        snprintf(load->error, sizeof(load->error), "%s",
+                 "Google compatibility page exceeded its bound");
+        load->status = SITE_ADAPTER_LOAD_FAILED;
+        return load;
+    }
+    load->document = (SiteAdapterDocument) {
+        .budget = budget,
+        .html = html,
+        .html_length = (size_t) length,
+        .status_code = 200
+    };
+    snprintf(load->document.adapter, sizeof(load->document.adapter), "%s",
+             "google-search-compat");
+    load->status = SITE_ADAPTER_LOAD_SUCCEEDED;
+    return load;
+}
+
+static SiteAdapterLoadStatus google_search_pump(
+    void *implementation, const FetchPumpQuota *quota)
+{
+    (void) quota;
+    GoogleSearchCompatibilityLoad *load = implementation;
+    return load == NULL ? SITE_ADAPTER_LOAD_FAILED : load->status;
+}
+
+static SiteAdapterLoadStatus google_search_status(const void *implementation)
+{
+    const GoogleSearchCompatibilityLoad *load = implementation;
+    return load == NULL ? SITE_ADAPTER_LOAD_FAILED : load->status;
+}
+
+static void google_search_cancel(void *implementation, const char *reason)
+{
+    (void) reason;
+    GoogleSearchCompatibilityLoad *load = implementation;
+    if (load != NULL) load->status = SITE_ADAPTER_LOAD_CANCELLED;
+}
+
+static bool google_search_take(
+    void *implementation, SiteAdapterDocument *document)
+{
+    GoogleSearchCompatibilityLoad *load = implementation;
+    if (load == NULL || document == NULL
+        || load->status != SITE_ADAPTER_LOAD_SUCCEEDED
+        || load->document.html == NULL) return false;
+    *document = load->document;
+    load->document = (SiteAdapterDocument) {0};
+    return true;
+}
+
+static bool google_search_metrics(
+    const void *implementation, SiteAdapterLoadMetrics *metrics)
+{
+    if (implementation == NULL || metrics == NULL) return false;
+    *metrics = (SiteAdapterLoadMetrics) {.build_slices = 1u};
+    return true;
+}
+
+static const char *google_search_error(const void *implementation)
+{
+    const GoogleSearchCompatibilityLoad *load = implementation;
+    return load == NULL ? "Google compatibility load is null" : load->error;
+}
+
+static void google_search_destroy(void *implementation)
+{
+    GoogleSearchCompatibilityLoad *load = implementation;
+    if (load == NULL) return;
+    Budget *budget = load->budget;
+    if (budget != NULL && load->document.html != NULL)
+        budget_free(budget, load->document.html);
+    if (budget != NULL) budget_free(budget, load);
+}
+
+static const SiteAdapterDefinition adapters[] = {
+    {
+        .name = "google-search-compat",
+        .requires_network = false,
+        .matches = google_search_matches,
+        .requires_stable_typography = NULL,
+        .begin = google_search_begin,
+        .pump = google_search_pump,
+        .status = google_search_status,
+        .cancel = google_search_cancel,
+        .take = google_search_take,
+        .metrics = google_search_metrics,
+        .error = google_search_error,
+        .destroy = google_search_destroy
+    },
+    {
+        .name = "youtube-lite",
+        .requires_network = true,
+        .matches = youtube_matches,
+        .requires_stable_typography = youtube_requires_stable_typography,
+        .begin = youtube_begin,
+        .pump = youtube_pump,
+        .status = youtube_status,
+        .cancel = youtube_cancel,
+        .take = youtube_take,
+        .metrics = youtube_metrics,
+        .error = youtube_error,
+        .destroy = youtube_destroy
+    }
+};
+
+static const SiteAdapterDefinition *site_adapter_find(
+    const char *method, const char *url)
+{
+    if (method == NULL || url == NULL || strcasecmp(method, "GET") != 0)
+        return NULL;
+    for (size_t i = 0; i < sizeof(adapters) / sizeof(adapters[0]); i++) {
+        if (adapters[i].matches(url)) return &adapters[i];
+    }
+    return NULL;
+}
+
+bool site_adapter_handles_navigation(const char *method, const char *url)
+{
+    return site_adapter_find(method, url) != NULL;
+}
+
+bool site_adapter_navigation_requires_network(
+    const char *method, const char *url)
+{
+    const SiteAdapterDefinition *definition =
+        site_adapter_find(method, url);
+    return definition == NULL || definition->requires_network;
+}
+
+bool site_adapter_navigation_requires_stable_typography(
+    const char *method, const char *url)
+{
+    const SiteAdapterDefinition *definition = site_adapter_find(method, url);
+    if (definition == NULL) return false;
+    /* The provider entry surface contains only the search affordance and is
+       intentionally useful on baseline fonts while optional faces load.
+       Result, channel, and watch documents use metric-sensitive cards. */
+    return definition->requires_stable_typography != NULL
+        && definition->requires_stable_typography(url);
+}
+
+SiteAdapterLoad *site_adapter_load_begin(
+    Budget *budget, BrowserSession *session, const char *method,
+    const char *url, const SiteAdapterPreferences *preferences,
+    size_t maximum_source_bytes, long timeout_ms,
+    char *error, size_t error_size)
+{
+    if (error != NULL && error_size != 0) error[0] = '\0';
+    const SiteAdapterDefinition *definition =
+        site_adapter_find(method, url);
+    if (budget == NULL || session == NULL || definition == NULL) {
+        if (error != NULL && error_size != 0)
+            snprintf(error, error_size, "%s", "no site adapter owns URL");
+        return NULL;
+    }
+    SiteAdapterLoad *load = budget_calloc_category(
+        budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*load));
+    if (load == NULL) {
+        if (error != NULL && error_size != 0)
+            snprintf(error, error_size, "%s",
+                     "site adapter exceeded its memory bound");
+        return NULL;
+    }
+    load->budget = budget;
+    load->definition = definition;
+    load->implementation = definition->begin(
+        budget, session, url, preferences, maximum_source_bytes, timeout_ms,
+        error, error_size);
+    if (load->implementation == NULL) {
+        budget_free(budget, load);
+        return NULL;
+    }
+    return load;
+}
+
+SiteAdapterLoadStatus site_adapter_load_pump(
+    SiteAdapterLoad *load, const FetchPumpQuota *quota)
+{
+    return load == NULL || load->definition == NULL
+        ? SITE_ADAPTER_LOAD_FAILED
+        : load->definition->pump(load->implementation, quota);
+}
+
+SiteAdapterLoadStatus site_adapter_load_status(const SiteAdapterLoad *load)
+{
+    return load == NULL || load->definition == NULL
+        ? SITE_ADAPTER_LOAD_FAILED
+        : load->definition->status(load->implementation);
+}
+
+void site_adapter_load_cancel(SiteAdapterLoad *load, const char *reason)
+{
+    if (load != NULL && load->definition != NULL)
+        load->definition->cancel(load->implementation, reason);
+}
+
+bool site_adapter_load_take_document(
+    SiteAdapterLoad *load, SiteAdapterDocument *document)
+{
+    return load != NULL && load->definition != NULL
+        && load->definition->take(load->implementation, document);
+}
+
+bool site_adapter_load_metrics(
+    const SiteAdapterLoad *load, SiteAdapterLoadMetrics *metrics)
+{
+    return load != NULL && load->definition != NULL
+        && load->definition->metrics(load->implementation, metrics);
+}
+
+const char *site_adapter_load_error(const SiteAdapterLoad *load)
+{
+    return load == NULL || load->definition == NULL
+        ? "site adapter load is null"
+        : load->definition->error(load->implementation);
+}
+
+void site_adapter_load_destroy(SiteAdapterLoad *load)
+{
+    if (load == NULL) return;
+    Budget *budget = load->budget;
+    if (load->definition != NULL)
+        load->definition->destroy(load->implementation);
+    budget_free(budget, load);
+}
+
+bool site_adapter_load_sync(
+    Budget *budget, BrowserSession *session, const char *method,
+    const char *url, const SiteAdapterPreferences *preferences,
+    size_t maximum_source_bytes, long timeout_ms,
+    SiteAdapterDocument *document, char *error, size_t error_size)
+{
+#ifdef __PSP__
+    (void) budget; (void) session; (void) method; (void) url;
+    (void) preferences; (void) maximum_source_bytes; (void) timeout_ms;
+    if (document != NULL) *document = (SiteAdapterDocument) {0};
+    if (error != NULL && error_size != 0) {
+        snprintf(
+            error, error_size,
+            "synchronous site adapters are disabled on PSP");
+    }
+    return false;
+#else
+    if (document == NULL) return false;
+    *document = (SiteAdapterDocument) {0};
+    SiteAdapterLoad *load = site_adapter_load_begin(
+        budget, session, method, url, preferences,
+        maximum_source_bytes, timeout_ms,
+        error, error_size);
+    if (load == NULL) return false;
+    SiteAdapterLoadStatus status = SITE_ADAPTER_LOAD_PENDING;
+    while (status == SITE_ADAPTER_LOAD_PENDING)
+        status = site_adapter_load_pump(load, NULL);
+    bool loaded = status == SITE_ADAPTER_LOAD_SUCCEEDED
+        && site_adapter_load_take_document(load, document);
+    if (!loaded && error != NULL && error_size != 0) {
+        snprintf(error, error_size, "%s", site_adapter_load_error(load));
+    }
+    site_adapter_load_destroy(load);
+    return loaded;
+#endif
+}
+
+void site_adapter_document_destroy(SiteAdapterDocument *document)
+{
+    if (document == NULL) return;
+    if (document->budget != NULL && document->html != NULL)
+        budget_free(document->budget, document->html);
+    *document = (SiteAdapterDocument) {0};
+}
+
+static bool reader_append(char *output, size_t capacity, size_t *used,
+                          const char *fragment)
+{
+    if (output == NULL || used == NULL || fragment == NULL
+        || *used >= capacity) return false;
+    size_t length = strlen(fragment);
+    if (length >= capacity - *used) return false;
+    memcpy(output + *used, fragment, length);
+    *used += length;
+    output[*used] = '\0';
+    return true;
+}
+
+bool site_adapter_reader_css(
+    const char *url, SiteAdapterReaderFont font, unsigned font_percent,
+    char *css, size_t capacity, char *adapter, size_t adapter_capacity)
+{
+    if (css == NULL || capacity == 0 || adapter == NULL
+        || adapter_capacity == 0
+        || (font != SITE_ADAPTER_READER_FONT_SANS
+            && font != SITE_ADAPTER_READER_FONT_SERIF)
+        || (font_percent != 80u && font_percent != 100u
+            && font_percent != 125u && font_percent != 150u)) {
+        return false;
+    }
+    css[0] = '\0';
+    adapter[0] = '\0';
+    if (url == NULL
+        || (strncasecmp(url, "https://", 8u) != 0
+            && strncasecmp(url, "http://", 7u) != 0)
+        || strstr(url, "://tilefinch.local/") != NULL) {
+        return false;
+    }
+
+    const char *family = font == SITE_ADAPTER_READER_FONT_SERIF
+        ? "serif" : "sans-serif";
+    char base[3072];
+    int length = snprintf(
+        base, sizeof(base),
+        "html:has(body[data-tilefinch-reader-kind]){display:block!important;"
+        "font-size:%u%%!important;"
+        "opacity:1!important;visibility:visible!important;"
+        "transform:none!important;animation:none!important;"
+        "transition:none!important;background:#f7f3ea!important;"
+        "color:#292724!important}"
+        "body[data-tilefinch-reader-kind]{box-sizing:border-box!important;"
+        "width:100%%!important;"
+        "min-width:0!important;max-width:none!important;margin:0!important;"
+        "padding:14px 16px!important;font-family:%s!important;"
+        /* `body > *` cannot select anonymous boxes created for direct body
+           text. Collapse the body's inherited text metrics while an
+           extracted presentation is active; the selected root restores the
+           readable metrics below. */
+        "font-size:0!important;line-height:0!important;display:block!important;"
+        "position:static!important;float:none!important;opacity:1!important;"
+        "visibility:hidden!important;transform:none!important;"
+        "animation:none!important;transition:none!important;"
+        "background:#f7f3ea!important;color:transparent!important}"
+        "[data-tilefinch-reader-root],[data-tilefinch-reader-root] h1,"
+        "[data-tilefinch-reader-root] h2,[data-tilefinch-reader-root] h3,"
+        "[data-tilefinch-reader-root] h4,[data-tilefinch-reader-root] h5,"
+        "[data-tilefinch-reader-root] h6,[data-tilefinch-reader-root] p,"
+        "[data-tilefinch-reader-root] p *,[data-tilefinch-reader-root] li,"
+        "[data-tilefinch-reader-root] li *,"
+        "[data-tilefinch-reader-root] blockquote,"
+        "[data-tilefinch-reader-root] blockquote *{font-family:%s!important}"
+        "[data-tilefinch-reader-root] pre,"
+        "[data-tilefinch-reader-root] code,"
+        "[data-tilefinch-reader-root] kbd,"
+        "[data-tilefinch-reader-root] samp,"
+        "[data-tilefinch-reader-root] pre *{font-family:monospace!important}",
+        font_percent, family, family);
+    if (length < 0 || (size_t) length >= sizeof(base)) return false;
+    size_t used = 0;
+    if (!reader_append(css, capacity, &used, base)) return false;
+
+    const char *content_shape =
+        "body[data-tilefinch-reader-kind]>*{display:none!important}"
+        "body[data-tilefinch-reader-kind=article]>[data-tilefinch-reader-root=article]:last-child,"
+        "body[data-tilefinch-reader-kind=listing]>[data-tilefinch-reader-root=listing]:last-child,"
+        "body[data-tilefinch-reader-kind=watch]>[data-tilefinch-reader-root=watch]:last-child,"
+        "body[data-tilefinch-reader-kind=basic]>[data-tilefinch-reader-root=basic]:last-child"
+        "{display:block!important;box-sizing:border-box!important;"
+        "position:static!important;float:none!important;width:100%!important;"
+        "min-width:0!important;max-width:none!important;margin:0!important;"
+        "padding:0!important;overflow:visible!important;opacity:1!important;"
+        "visibility:visible!important;transform:none!important;"
+        "animation:none!important;transition:none!important;"
+        "font-size:1rem!important;line-height:1.55!important;"
+        "background:#f7f3ea!important;color:#292724!important}"
+        "[data-tilefinch-reader-root] *{box-sizing:border-box!important;"
+        "position:static!important;float:none!important;left:auto!important;"
+        "right:auto!important;top:auto!important;bottom:auto!important;"
+        "transform:none!important;animation:none!important;transition:none!important;"
+        "opacity:1!important;visibility:visible!important;min-width:0!important;"
+        "max-width:100%!important;background-image:none!important;"
+        "box-shadow:none!important}"
+        "[data-tilefinch-reader-root]>header{display:block!important;"
+        "margin:0 0 12px!important;padding:0 0 7px!important;"
+        "font-size:.78rem!important;color:#665f57!important;"
+        "background:transparent!important;border-bottom:1px solid #b8aa98!important}"
+        "[data-tilefinch-reader-root] h1,[data-tilefinch-reader-root] h2,"
+        "[data-tilefinch-reader-root] h3,[data-tilefinch-reader-root] h4,"
+        "[data-tilefinch-reader-root] h5,[data-tilefinch-reader-root] h6{"
+        "display:block!important;clear:both!important;width:auto!important;"
+        "height:auto!important;margin:.65em 0 .35em!important;padding:0!important;"
+        "line-height:1.2!important;color:#201f1d!important;"
+        "background:transparent!important}"
+        "[data-tilefinch-reader-root] h1{font-size:1.55rem!important}"
+        "[data-tilefinch-reader-root] h2{font-size:1.3rem!important}"
+        "[data-tilefinch-reader-root] h3{font-size:1.15rem!important}"
+        "[data-tilefinch-reader-root] h4,[data-tilefinch-reader-root] h5,"
+        "[data-tilefinch-reader-root] h6{font-size:1.05rem!important}"
+        "[data-tilefinch-reader-root] p,[data-tilefinch-reader-root] li,"
+        "[data-tilefinch-reader-root] blockquote{height:auto!important;"
+        "margin-top:0!important;margin-bottom:.8em!important;"
+        "color:#292724!important;background:transparent!important}"
+        "[data-tilefinch-reader-root] a{color:#164f9e!important;"
+        "display:inline!important;width:auto!important;height:auto!important;"
+        "background:transparent!important;text-decoration:underline!important}"
+        "[data-tilefinch-reader-root] [data-tilefinch-reader-anchor]{"
+        "display:block!important;width:0!important;height:0!important;"
+        "min-height:0!important;margin:0!important;padding:0!important;"
+        "border:0!important;overflow:hidden!important;line-height:0!important;"
+        "font-size:0!important;text-decoration:none!important}"
+        "[data-tilefinch-reader-root] ul,[data-tilefinch-reader-root] ol{"
+        "display:block!important;margin:.4em 0 .9em!important;"
+        "padding-left:22px!important;background:transparent!important}"
+        "[data-tilefinch-reader-root] figure{display:block!important;"
+        "margin:12px 0!important;padding:0!important;background:transparent!important}"
+        "[data-tilefinch-reader-root] figcaption,[data-tilefinch-reader-root] caption{"
+        "display:block!important;margin:5px 0!important;color:#665f57!important;"
+        "font-size:.82rem!important;line-height:1.35!important;"
+        "background:transparent!important}";
+    const char *content_detail_shape =
+        "[data-tilefinch-reader-root] img{display:block!important;"
+        "max-width:100%!important;height:auto!important;background:transparent!important}"
+        "[data-tilefinch-reader-root] table{display:block!important;"
+        "box-sizing:border-box!important;width:100%!important;max-width:100%!important;"
+        "overflow:hidden!important;table-layout:fixed!important;"
+        "border-collapse:collapse!important;background:#f7f3ea!important}"
+        "[data-tilefinch-reader-root] th,[data-tilefinch-reader-root] td{"
+        "max-width:100%!important;padding:4px 6px!important;"
+        "word-break:break-word!important;white-space:normal!important;"
+        "color:#292724!important;background:transparent!important;"
+        "border:1px solid #b8aa98!important}"
+        "[data-tilefinch-reader-root] pre{display:block!important;"
+        "box-sizing:border-box!important;width:100%!important;max-width:100%!important;"
+        "overflow:hidden!important;margin:.7em 0!important;padding:8px!important;"
+        "white-space:pre-wrap!important;word-break:break-word!important;"
+        "color:#292724!important;background:#ece5d9!important;"
+        "border:1px solid #c9bca9!important}"
+        "[data-tilefinch-reader-root] :not(pre)>code,"
+        "[data-tilefinch-reader-root] kbd,[data-tilefinch-reader-root] samp{"
+        "color:#292724!important;background:#ece5d9!important}"
+        "[data-tilefinch-reader-root] blockquote{"
+        "border-left:3px solid #b8aa98!important;color:#4f4a44!important}"
+        "[data-tilefinch-reader-root=listing] article,"
+        "[data-tilefinch-reader-root=watch] section>article{"
+        "display:block!important;box-sizing:border-box!important;width:100%!important;"
+        "min-height:72px!important;margin:0!important;padding:7px 2px!important;"
+        "overflow:hidden!important;border-bottom:1px solid #b8a58f!important}"
+        "[data-tilefinch-reader-root=watch]>h2{clear:both!important;"
+        "margin-top:16px!important;padding-top:8px!important;"
+        "border-top:2px solid #8f775f!important}"
+        "[data-tilefinch-reader-root=basic] form{display:block!important;"
+        "width:100%!important;margin:10px 0!important;padding:8px!important;"
+        "background:#ece5d9!important;border:1px solid #b8aa98!important}"
+        "[data-tilefinch-reader-root=basic] label{display:block!important;"
+        "margin:3px 0!important;color:#292724!important;background:transparent!important}"
+        "[data-tilefinch-reader-root=basic] input:not([type=hidden]),"
+        "[data-tilefinch-reader-root=basic] select,"
+        "[data-tilefinch-reader-root=basic] textarea{display:block!important;"
+        "width:100%!important;min-height:28px!important;margin:4px 0!important;"
+        "padding:4px!important;color:#201f1d!important;background:#fff!important;"
+        "border:1px solid #8f775f!important}"
+        "[data-tilefinch-reader-root=basic] button,"
+        "[data-tilefinch-reader-root=basic] input[type=submit]{display:block!important;"
+        "width:auto!important;min-height:28px!important;margin:6px 0!important;"
+        "padding:4px 10px!important;color:#fff!important;"
+        "background:#164f9e!important;border:1px solid #103b75!important}";
+    if (!reader_append(css, capacity, &used, content_shape)
+        || !reader_append(css, capacity, &used, content_detail_shape)) {
+        return false;
+    }
+    snprintf(adapter, adapter_capacity, "%s", "reader-content-shape");
+    return true;
+}

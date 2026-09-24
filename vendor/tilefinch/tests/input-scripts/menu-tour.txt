@@ -1,0 +1,113 @@
+# Tilefinch scripted-input scenario: goal-oriented chrome tour.
+#
+# Menu rows are Home, Tabs, Page tools, Library, Settings,
+# Help & diagnostics, and Exit to XMB. SELECT closes the whole hierarchy;
+# CIRCLE returns one level. The stepper pauses while engine work is busy.
+
+wait 30
+mark boot
+
+# Native HOME and tab creation.
+tap down
+tap right
+wait 4
+mark home-first
+tap select
+tap down
+tap cross
+wait 8
+mark tabs-first
+tap down
+tap cross
+wait 12
+mark home-tab
+
+# Library opens directly. L/R reaches Screenshots without separate menu rows.
+tap select
+press 2 down
+tap cross
+wait 8
+mark library
+press 4 rtrigger
+wait 8
+mark screenshots
+tap cross
+wait 20
+mark page
+
+# Ordinary page interaction remains contextual.
+tap down
+tap right
+tap rtrigger
+tap ltrigger
+wait 8
+mark scrolled
+tap square
+wait 30
+mark reloaded
+
+# Page tools owns Reader, Basic view, and the site-scoped Reader preference.
+tap select
+tap up
+tap cross
+tap down
+tap cross
+wait 20
+mark reader
+tap select
+tap cross
+tap down
+tap cross
+wait 20
+mark reader-off
+tap select
+tap cross
+press 6 down
+tap cross
+tap cross
+press 3 down
+tap cross
+wait 10
+mark reader-site
+tap select
+
+# Settings is a destination; Appearance is the first category.
+tap select
+press 2 down
+tap cross
+tap cross
+wait 6
+mark appearance
+tap right
+tap down
+tap right
+tap down
+tap right
+tap circle
+tap circle
+wait 8
+mark appearance-done
+
+# Help is discoverable and returns one level before the root closes.
+tap down
+tap cross
+wait 6
+mark help
+tap circle
+tap circle
+
+# Return HOME, then exit from the seven-row root.
+tap select
+press 5 up
+tap cross
+wait 20
+mark home
+tap down
+tap right
+mark home-moved
+tap select
+press 6 down
+tap cross
+wait 4
+mark exiting
+end

@@ -1,0 +1,21 @@
+start version=3 argv0=host0:/komi-player.prx heap-used=1192 heap-free=3160 kernel-free=2359296
+videos=10 list=host0:/komi-videos.txt
+wifi-profile 1 ssid="(伏せ字)"
+wifi-profile 2 ssid="(伏せ字)"
+wifi-profile 3 ssid="(伏せ字)"
+wifi-profile 4 ssid="(伏せ字)"
+wifi-profile 7 ssid="(伏せ字)"
+network READY profile=7 elapsed=4618ms status=ready phase=idle native=0x00000000 apctl=4 wlan-switch=1 wlan-power=1 heap-used=5540376
+ready heap-used=5706088 heap-free=1548184 budget=419232
+video 1 id=(伏せ字) PASS outcome=ok first-frame=4023ms position=29928ms frames=898 buffering=0ms heap-used=5706088->6842136(peak 8463832) heap-free=674280 decoded=898 dropped=0 audio-dropped=0 format=480x360 itag=134/140 split title="(伏せ字)" status=""
+video 2 id=jNQXAC9IVRw PASS outcome=ended first-frame=2234ms position=18750ms frames=281 buffering=0ms heap-used=6842136->6987848(peak 8621928) heap-free=528568 decoded=282 dropped=3 audio-dropped=0 format=320x240 itag=133/140 split title="Me at the zoo" status=""
+video 3 id=dQw4w9WgXcQ PASS outcome=ok first-frame=2235ms position=29928ms frames=748 buffering=0ms heap-used=6987848->6988856(peak 8754008) heap-free=527560 decoded=749 dropped=0 audio-dropped=0 format=640x360 itag=134/140 split title="Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)" status=""
+video 4 id=(伏せ字) PASS outcome=ok first-frame=2435ms position=29928ms frames=748 buffering=0ms heap-used=6988856->6988344(peak 8758472) heap-free=528072 decoded=749 dropped=0 audio-dropped=0 format=480x360 itag=134/140 split title="(伏せ字)" status=""
+video 5 id=9bZkp7q19f0 PASS outcome=ok first-frame=2301ms position=29928ms frames=718 buffering=0ms heap-used=6988344->6989608(peak 8754568) heap-free=526808 decoded=719 dropped=0 audio-dropped=0 format=640x360 itag=134/140 split title="PSY - GANGNAM STYLE(강남스타일) M/V" status=""
+video 6 id=M7lc1UVf-VE PASS outcome=ok first-frame=2274ms position=29865ms frames=896 buffering=0ms heap-used=6989608->6991016(peak 8781368) heap-free=525400 decoded=896 dropped=0 audio-dropped=0 format=640x360 itag=134/140 split title="YouTube Developers Live: Embedded Web Player Customization" status=""
+video 7 id=kJQP7kiw5Fk PASS outcome=ok first-frame=2218ms position=29928ms frames=718 buffering=0ms heap-used=6991016->6991976(peak 8761848) heap-free=524440 decoded=718 dropped=0 audio-dropped=0 format=640x360 itag=134/140 split title="Luis Fonsi - Despacito ft. Daddy Yankee" status=""
+video 8 id=OPf0YbXqDm0 PASS outcome=ok first-frame=2218ms position=29928ms frames=718 buffering=0ms heap-used=6991976->6849176(peak 8758840) heap-free=667240 decoded=0 dropped=0 audio-dropped=0 format=640x360 itag=134/140 split title="Mark Ronson - Uptown Funk (Official Video) ft. Bruno Mars" status=""
+video 9 id=fJ9rUzIMcZQ PASS outcome=ok first-frame=2284ms position=29928ms frames=748 buffering=0ms heap-used=6849176->6994616(peak 8616472) heap-free=521800 decoded=749 dropped=0 audio-dropped=0 format=640x360 itag=134/140 split title="Queen – Bohemian Rhapsody (Official Video Remastered)" status=""
+video 10 id=aqz-KE-bpKQ PASS outcome=ok first-frame=2268ms position=29813ms frames=894 buffering=0ms heap-used=6994616->6995384(peak 8764616) heap-free=521032 decoded=895 dropped=0 audio-dropped=0 format=640x360 itag=134/140 split title="Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film" status=""
+SUMMARY played=10 failed=0 of=10 heap-used baseline=5706088 end=6995384 peak=8781368 budget-now=2326386
+end

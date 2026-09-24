@@ -1,0 +1,24 @@
+# DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
+#
+# This opens a watch document, activates its explicit native-player thumbnail,
+# then sends three Right edges while the first preview transaction can still
+# be active. The target must continue to advance instead of ignoring input
+# until the preview picture returns.
+wait-live 600
+tap-live cross
+wait-live 600
+mark-live autoplay
+tap-live right
+wait-live 2
+tap-live right
+wait-live 2
+tap-live right
+mark-live coalesced-seek
+wait-live 600
+mark-live pre-commit
+tap-live cross
+wait-live 1800
+mark-live committed-seek
+tap-live circle
+wait-live 180
+end

@@ -1,0 +1,165 @@
+#ifndef TILEFINCH_SCRIPT_LOADER_H
+#define TILEFINCH_SCRIPT_LOADER_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "tilefinch/navigation.h"
+
+typedef struct {
+    size_t discovered;
+    size_t attempted;
+    size_t loaded;
+    size_t failed;
+    /* A strict subset of `failed`: author source reached the evaluator and
+       failed there. Transport, MIME, integrity, CSP and quota refusals do not
+       advance this counter, so parser recovery never mistakes dead URLs for
+       a broken JavaScript realm. */
+    size_t execution_failures;
+    /* Monotonic time spent inside the evaluator only. Fetching, stylesheet
+       checkpoints and other element-close work are deliberately excluded. */
+    uint64_t execution_us;
+    /* Security-policy refusals remain part of `failed` for the existing
+       user-visible diagnostics, but are not author-code execution failures.
+       Parser hydration uses this subset to avoid opening its consecutive
+       execution-failure circuit on a deliberately restrictive page policy. */
+    size_t policy_refusals;
+    size_t skipped_cross_origin;
+    size_t skipped_module;
+    size_t skipped_nomodule;
+    size_t skipped_quota;
+    size_t skipped_pressure;
+    size_t pressure_collections;
+    size_t pressure_reclaimed_bytes;
+    size_t pressure_capped_requests;
+    /* Complete decoded/cache/network source bytes presented to the script
+       pipeline, whether admission, compilation, or evaluation later succeeds.
+       Parser hydration uses this independent counter as its cumulative work
+       authority; `bytes` retains its historical successfully-loaded meaning. */
+    size_t source_work_bytes;
+    size_t bytes;
+    size_t cache_hits;
+    size_t parser_blocking;
+    size_t deferred;
+    size_t asynchronous;
+    size_t modules;
+    size_t module_map_hits;
+    size_t lazy_webpack_candidates;
+    size_t lazy_webpack_applied;
+    size_t lazy_webpack_fallbacks;
+    size_t lazy_webpack_factories;
+    size_t lazy_webpack_source_bytes;
+    size_t inline_data_fast_paths;
+    size_t inline_data_fast_path_bytes;
+    size_t inline_data_quota_exemptions;
+    size_t cost_class_rejections;
+    size_t watchdog_classification_misses;
+    size_t watchdog_classification_miss_bytes;
+    size_t watchdog_classification_miss_loops;
+    unsigned watchdog_classification_miss_flags;
+} ExternalScriptMetrics;
+
+enum {
+    SCRIPT_COST_SIGNAL_EVAL = 1u << 0,
+    SCRIPT_COST_SIGNAL_FUNCTION_CTOR = 1u << 1,
+    SCRIPT_COST_SIGNAL_DOCUMENT_WRITE = 1u << 2,
+    SCRIPT_COST_SIGNAL_FUNCTION_DECL = 1u << 3
+};
+
+typedef struct {
+    size_t bytes;
+    size_t loops;
+    unsigned flags;
+} ScriptStaticCostProfile;
+
+/* Allocation-free lexical telemetry used by the bounded admission policy.
+   This is a content-shape scan, not a JavaScript parser. */
+void script_static_cost_profile(
+    const char *source, size_t length, ScriptStaticCostProfile *profile);
+bool script_static_cost_rejects(
+    const ScriptStaticCostProfile *profile, bool third_party, bool module);
+
+typedef struct {
+    long parser_executed[256];
+    size_t parser_executed_count;
+    ExternalScriptMetrics early;
+} StreamingScriptState;
+
+/* Parser-blocking scripts observe the author stylesheet state that precedes
+   them. Deferred, asynchronous, module, and inert script elements do not
+   block parsing and must not force the blocking resource pipeline to run at
+   their closing tag. */
+bool document_script_is_parser_blocking(lxb_dom_node_t *element);
+
+typedef enum {
+    DOCUMENT_SCRIPT_PROCESS_COMPLETE = 0,
+    DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE,
+    /* The caller-provided per-source limit rejected the complete external or
+       data: body. Callers which narrowed that limit to a cumulative allowance
+       can distinguish exhaustion from an ordinary transport/load failure. */
+    DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT
+} DocumentScriptProcessResult;
+
+DocumentScriptProcessResult document_scripts_process_closed(
+    ScriptRuntime *runtime, Budget *budget, BrowserSession *session,
+    const char *base_url, const char *document_url,
+    const char *referrer_policy,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t maximum_scripts, size_t maximum_total_bytes,
+    size_t maximum_file_bytes, long timeout_ms, FetchScheduler *scheduler,
+    lxb_dom_node_t *element, StreamingScriptState *state);
+bool document_scripts_finish_streaming(
+    PocDocument *document, ScriptRuntime *runtime, Budget *budget,
+    BrowserSession *session, const char *base_url,
+    const char *document_url,
+    const char *referrer_policy, size_t maximum_scripts,
+    size_t maximum_total_bytes, size_t maximum_file_bytes, long timeout_ms,
+    FetchScheduler *scheduler, StreamingScriptState *state,
+    ExternalScriptMetrics *metrics, ScriptResult *result);
+
+/* Legacy whole-document classic-script entry point.  All three limits remain
+   enforced for compatibility, but new navigation code should configure the
+   realm once and use the document pipeline below. */
+bool external_scripts_load(NavigationSession *navigation,
+                           const char *document_url,
+                           size_t maximum_scripts,
+                           size_t maximum_total_bytes,
+                           size_t maximum_file_bytes,
+                           long timeout_ms,
+                           ExternalScriptMetrics *metrics);
+/* `maximum_scripts` is the realm-wide executable quota. Parser discovery uses
+   the fixed hard bound so repeated module roots can share one module-map
+   admission and a bounded set of critical bootstrap roots can be reserved
+   without changing source-order execution. Cumulative count and total-byte
+   authority lives in the ScriptRuntime realm configured by navigation;
+   `maximum_total_bytes` is retained as an ABI-compatible hint and must
+   describe that same realm, while `maximum_file_bytes` bounds each root and
+   transitive module response. */
+bool document_scripts_execute(PocDocument *document,
+                              ScriptRuntime *runtime, Budget *budget,
+                              BrowserSession *session,
+                              const char *base_url,
+                              const char *document_url,
+                              const char *referrer_policy,
+                              size_t maximum_scripts,
+                              size_t maximum_total_bytes,
+                              size_t maximum_file_bytes,
+                              long timeout_ms,
+                              FetchScheduler *scheduler,
+                              ExternalScriptMetrics *metrics,
+                              ScriptResult *result);
+bool document_body_scripts_execute(PocDocument *document,
+                                   ScriptRuntime *runtime, Budget *budget,
+                                   BrowserSession *session,
+                                   const char *base_url,
+                                   const char *document_url,
+                                   const char *referrer_policy,
+                                   size_t maximum_scripts,
+                                   size_t maximum_total_bytes,
+                                   size_t maximum_file_bytes,
+                                   long timeout_ms,
+                                   FetchScheduler *scheduler,
+                                   ExternalScriptMetrics *metrics,
+                                   ScriptResult *result);
+
+#endif

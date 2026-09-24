@@ -1,0 +1,21 @@
+start version=2 argv0=host0:/komi-player.prx heap-used=1192 heap-free=3672 kernel-free=2359296
+videos=10 list=host0:/komi-videos.txt
+wifi-profile 1 ssid="(伏せ字)"
+wifi-profile 2 ssid="(伏せ字)"
+wifi-profile 3 ssid="(伏せ字)"
+wifi-profile 4 ssid="(伏せ字)"
+wifi-profile 7 ssid="(伏せ字)"
+network READY profile=7 elapsed=4670ms status=ready phase=idle native=0x00000000 apctl=4 wlan-switch=1 wlan-power=1 heap-used=5540376
+ready heap-used=5706088 heap-free=1548696 budget=419232
+video 1 id=(伏せ字) PASS outcome=ok first-frame=5222ms position=29911ms frames=897 buffering=0ms heap-used=5706088->6833016(peak 8453736) heap-free=683912 decoded=898 dropped=0 title="(伏せ字)" status=""
+video 2 id=jNQXAC9IVRw PASS outcome=ended first-frame=2285ms position=18750ms frames=281 buffering=0ms heap-used=6833016->6987752(peak 8593976) heap-free=529176 decoded=282 dropped=3 title="Me at the zoo" status=""
+video 3 id=dQw4w9WgXcQ PASS outcome=ok first-frame=2235ms position=29928ms frames=748 buffering=0ms heap-used=6987752->6988840(peak 8758856) heap-free=528088 decoded=749 dropped=0 title="Rick Astley - Never Gonna Give You Up (Official" status=""
+video 4 id=(伏せ字) PASS outcome=ok first-frame=3202ms position=29928ms frames=748 buffering=0ms heap-used=6988840->7037176(peak 8809944) heap-free=2183688 decoded=749 dropped=0 title="(伏せ字)" status=""
+video 5 id=9bZkp7q19f0 PASS outcome=ok first-frame=2251ms position=29928ms frames=718 buffering=0ms heap-used=7037176->7047448(peak 8808056) heap-free=2107880 decoded=719 dropped=0 title="PSY - GANGNAM STYLE(강남스타일) M/V" status=""
+video 6 id=M7lc1UVf-VE PASS outcome=ok first-frame=2451ms position=29911ms frames=897 buffering=0ms heap-used=7047448->7057496(peak 8831336) heap-free=2097832 decoded=898 dropped=0 title="YouTube Developers Live: Embedded Web Player Cu" status=""
+video 7 id=kJQP7kiw5Fk PASS outcome=ok first-frame=2251ms position=29928ms frames=718 buffering=0ms heap-used=7057496->7058744(peak 8823784) heap-free=2096584 decoded=719 dropped=0 title="Luis Fonsi - Despacito ft. Daddy Yankee" status=""
+video 8 id=OPf0YbXqDm0 PASS outcome=ok first-frame=2268ms position=29928ms frames=718 buffering=0ms heap-used=7058744->7059704(peak 8824360) heap-free=2095624 decoded=719 dropped=0 title="Mark Ronson - Uptown Funk (Official Video) ft. " status=""
+video 9 id=fJ9rUzIMcZQ PASS outcome=ok first-frame=2268ms position=29928ms frames=748 buffering=0ms heap-used=7059704->7061096(peak 8827864) heap-free=2094232 decoded=749 dropped=0 title="Queen – Bohemian Rhapsody (Official Video Rem" status=""
+video 10 id=aqz-KE-bpKQ PASS outcome=ok first-frame=2351ms position=29911ms frames=897 buffering=0ms heap-used=7061096->7061896(peak 8831016) heap-free=2093432 decoded=898 dropped=0 title="Big Buck Bunny 60fps 4K - Official Blender Foun" status=""
+SUMMARY played=10 failed=0 of=10 heap-used baseline=5706088 end=7061896 peak=8831336 budget-now=2391954
+end

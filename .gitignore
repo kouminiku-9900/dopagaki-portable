@@ -1,0 +1,10 @@
+/.venv/
+/tools/
+/dist/
+/build/
+.DS_Store
+__pycache__/
+*.pyc
+/field-logs/
+/tools
+/.venv

@@ -1,0 +1,13 @@
+# komi-player test list: one 11-character YouTube video ID per line.
+# Each is opened, played for 30 s (or to its end), and closed, in order.
+# All resolved on the Mac on 2026-09-24 (vendor/tilefinch resolver probe, 360p).
+LXb3EKWsInQ
+jNQXAC9IVRw   # 19 s, 320x240: must reach its end
+dQw4w9WgXcQ
+YQHsXMglC9A
+9bZkp7q19f0
+M7lc1UVf-VE   # 22 min
+kJQP7kiw5Fk
+OPf0YbXqDm0
+fJ9rUzIMcZQ
+aqz-KE-bpKQ   # 10 min

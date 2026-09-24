@@ -1,0 +1,18 @@
+{
+  "tilefinch": {
+    "url": "https://github.com/stjanovitz/tilefinch.git",
+    "base_commit": "5a77720f31bf62007249ec458109da50ae7a5a05",
+    "vendored": "vendor/tilefinch (modified for komi-tube)",
+    "license": "MIT; third-party notices accompany the binary"
+  },
+  "pspdev": {
+    "version": "v20260901",
+    "url": "https://github.com/pspdev/pspdev/releases/download/v20260901/pspdev-macos-latest-arm64.tar.gz",
+    "sha256": "3d1308c94d437619569923d0b65a2d8cec6b6c7f3666d83959f9c38041a8e6f7"
+  },
+  "ppsspp": {
+    "version": "v1.20.4",
+    "url": "https://github.com/hrydgard/ppsspp/releases/download/v1.20.4/PPSSPPSDL-macOS-v1.20.4.zip",
+    "sha256": "fb32a215861a293c28f641bf47f3164766ba512214025f4457796c8d14242665"
+  }
+}

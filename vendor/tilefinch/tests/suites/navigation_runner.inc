@@ -1,0 +1,112 @@
+int main(int argc, char **argv)
+{
+#define RUN_TEST(test) do {                                                  \
+    if (!(test)()) {                                                         \
+        fprintf(stderr, "navigation load test failed: %s\n", #test);      \
+        return 1;                                                            \
+    }                                                                        \
+} while (0)
+    if (argc == 2 && strcmp(argv[1], "--static-image-layout-only") == 0) {
+        RUN_TEST(test_static_images_retry_after_transient_idle_failure);
+        RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
+        RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
+        RUN_TEST(test_visible_lazy_queue_continues_after_first_pair);
+        puts("static image layout tests passed");
+        return 0;
+    }
+    RUN_TEST(test_pump_and_cancel);
+    RUN_TEST(test_progressive_preview_is_bounded_and_transient);
+    RUN_TEST(test_failed_candidate_rolls_back_presented_preview);
+    RUN_TEST(test_progressive_preview_waits_for_external_visuals);
+    RUN_TEST(test_markup_priority_survives_preview_pressure);
+    RUN_TEST(test_background_images_continue_after_useful_paint);
+    RUN_TEST(test_background_image_failure_retains_visible_prefix);
+    RUN_TEST(test_static_images_retry_after_transient_idle_failure);
+    RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
+    RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
+    RUN_TEST(test_deferred_jpeg_decode_publishes_on_later_pump);
+    RUN_TEST(test_visible_lazy_queue_continues_after_first_pair);
+    RUN_TEST(test_focused_deferred_image_follows_active_pair);
+    RUN_TEST(test_deferred_image_focus_rotation_preserves_order);
+    RUN_TEST(test_visible_lazy_pair_retries_only_failed_suffix);
+    RUN_TEST(test_failed_visible_image_retries_after_first_paint);
+    RUN_TEST(test_web_fonts_begin_after_fallback_layout);
+    RUN_TEST(test_streaming_preview_precedes_eof);
+    RUN_TEST(test_parser_checkpoint_refusals_preserve_server_dom);
+    RUN_TEST(test_parser_script_stage_circuit_preserves_actions);
+    RUN_TEST(test_parser_transport_failures_do_not_retire_realm);
+    RUN_TEST(test_parser_script_stage_watchdog_and_failure_reset);
+    RUN_TEST(test_parser_script_mutation_rebinds_live_node);
+    RUN_TEST(test_failed_external_parser_source_counts_as_work);
+    RUN_TEST(test_parser_mutation_checkpoint_uses_stage_deadline);
+    RUN_TEST(test_late_server_actions_refresh_hydration_snapshot);
+    RUN_TEST(test_resource_scheduler_refusal_is_not_script_degradation);
+    RUN_TEST(test_streaming_preview_skips_inert_prefix_layout);
+    RUN_TEST(test_streaming_preview_pressure_preserves_final_commit);
+    RUN_TEST(test_streaming_stylesheet_continuation_converges);
+    RUN_TEST(test_streaming_preview_rejects_incomplete_external_css);
+    RUN_TEST(test_streaming_stylesheet_follows_late_viewport);
+    RUN_TEST(test_streaming_preview_cancel_is_transient);
+    RUN_TEST(test_parser_blocking_script_classification);
+    RUN_TEST(test_valid_meta_referrer_overrides_response_policy);
+    RUN_TEST(test_invalid_meta_referrer_preserves_response_policy);
+    RUN_TEST(test_rebuild_without_history_keeps_external_css);
+    RUN_TEST(test_finalize_cancellation_is_transactional);
+    RUN_TEST(test_streamed_candidate_remote_binding_isolation);
+    RUN_TEST(test_candidate_cancel_preserves_late_incumbent_dom);
+    RUN_TEST(test_bounded_finalize_preserves_history_pruning);
+    RUN_TEST(test_relayout_damage_tracks_paint_only_fields);
+    RUN_TEST(test_candidate_hook_set_is_transactional);
+    RUN_TEST(test_script_oom_retains_usable_target);
+    RUN_TEST(test_late_script_oom_reveals_staged_page_shell);
+    RUN_TEST(test_caught_large_allocation_retires_staged_page_shell);
+    RUN_TEST(test_caught_large_allocation_keeps_visible_runtime);
+    RUN_TEST(test_caught_allocation_keeps_gradient_presentation);
+    RUN_TEST(test_caught_allocation_keeps_bounded_reader_runtime);
+    RUN_TEST(test_caught_large_allocation_does_not_reveal_raw_app_shell);
+    RUN_TEST(test_late_script_oom_frees_queued_frame_messages);
+    RUN_TEST(test_cross_origin_image_taints_canvas);
+    RUN_TEST(test_authored_oom_text_does_not_trigger_static_recovery);
+    RUN_TEST(test_late_oom_static_relayout_refusal_is_transactional);
+    RUN_TEST(test_low_memory_replacement_success);
+    RUN_TEST(test_streaming_dynamic_stylesheets_are_not_adopted);
+    RUN_TEST(test_dynamic_stylesheet_event_rescan_is_reentrant_safe);
+    RUN_TEST(test_stylesheet_event_microtask_exception_is_nonfatal);
+    RUN_TEST(test_dynamic_stylesheet_href_base_and_reinsert_lifecycle);
+    RUN_TEST(test_low_memory_external_script_incumbent_falls_back);
+    RUN_TEST(test_low_memory_replacement_failure_boundaries);
+    RUN_TEST(test_sectioned_path);
+    RUN_TEST(test_authoritative_layout_resumes_across_finalize_ticks);
+    RUN_TEST(test_resumable_layout_cancel_preserves_incumbent);
+    RUN_TEST(test_response_headers_precede_parser_script_and_viewport);
+    RUN_TEST(test_response_csp_gates_parser_and_resource_paths);
+    RUN_TEST(test_frame_response_policy_precedes_child_execution);
+    RUN_TEST(test_preload_settlement_releases_scheduler_slots);
+    RUN_TEST(test_raw_scanner_preloads_parser_blocking_script);
+    RUN_TEST(test_compiled_stylesheet_reuse_stays_in_navigation_ram);
+    RUN_TEST(test_compiled_stylesheet_cache_rechecks_inline_nonce);
+    RUN_TEST(test_compiled_stylesheet_cache_rechecks_link_authority);
+    RUN_TEST(test_critical_ch_body_is_not_page_visible);
+    RUN_TEST(test_redirected_critical_ch_retries_final_origin);
+    RUN_TEST(test_safe_section_before_eof);
+    RUN_TEST(test_mismatched_close_is_not_sealed);
+    RUN_TEST(test_canvas_surface_survives_and_updates_without_relayout);
+    RUN_TEST(test_canvas_fallback_text_mutation_remains_replaced);
+    RUN_TEST(test_canvas_oversized_dimensions_are_bounded);
+    RUN_TEST(test_canvas_surface_count_is_bounded);
+    RUN_TEST(test_canvas_draw_image_accepts_loaded_html_image);
+    RUN_TEST(test_detached_canvas_publishes_when_inserted);
+    RUN_TEST(test_script_frontier_snapshot_survives_author_mutation);
+    RUN_TEST(test_navigation_keeps_server_dom_after_author_script_error);
+    RUN_TEST(test_document_script_refresh_failure_stops_following_scripts);
+    RUN_TEST(test_script_frontier_skips_destroyed_snapshot_nodes);
+    RUN_TEST(test_script_frontier_snapshot_capacity_is_explicit);
+    RUN_TEST(test_preserved_runtime_retires_replaced_document);
+    RUN_TEST(test_iframe_discovery_weak_handle_survives_reclaim);
+    RUN_TEST(test_transient_document_survives_active_rebind_until_detach);
+    RUN_TEST(test_preserved_runtime_dynamic_import_owns_scheduler);
+    RUN_TEST(test_delayed_import_after_module_pipeline_failure);
+#undef RUN_TEST
+    puts("navigation load tests passed");
+    return 0;
+}

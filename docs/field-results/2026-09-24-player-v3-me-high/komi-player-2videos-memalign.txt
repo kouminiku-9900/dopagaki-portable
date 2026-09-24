@@ -1,0 +1,17 @@
+start version=3 argv0=host0:/komi-player.prx heap-used=1192 heap-free=2392 kernel-free=2359296
+config me_high=1 play_seconds=10
+me-high ballast=0x08a5eac0..0x0a040000 bytes=22943040
+memalign bytes=5538132 align=4194304 at=0x0a400000 side=high
+me-pool next-block=0x0a040010 side=high
+videos=2 list=host0:/komi-videos.txt
+wifi-profile 1 ssid="(伏せ字)"
+wifi-profile 2 ssid="(伏せ字)"
+wifi-profile 3 ssid="(伏せ字)"
+wifi-profile 4 ssid="(伏せ字)"
+wifi-profile 7 ssid="(伏せ字)"
+network READY profile=7 elapsed=4628ms status=ready phase=idle native=0x00000000 apctl=4 wlan-switch=1 wlan-power=1 heap-used=28483432
+ready heap-used=28649144 heap-free=3770184 budget=419232
+video 1 id=(伏せ字) PASS outcome=ok first-frame=4047ms position=9925ms frames=298 buffering=0ms heap-used=28649144->29785192(peak 31405864) heap-free=2634136 decoded=299 dropped=0 audio-dropped=0 format=480x360 itag=134/140 split title="(伏せ字)" status=""
+video 2 id=jNQXAC9IVRw PASS outcome=ok first-frame=2752ms position=9925ms frames=149 buffering=0ms heap-used=29785192->29930904(peak 31547112) heap-free=2488424 decoded=150 dropped=0 audio-dropped=0 format=320x240 itag=133/140 split title="Me at the zoo" status=""
+SUMMARY played=2 failed=0 of=2 heap-used baseline=28649144 end=29930904 peak=31547112 budget-now=2326386
+end
