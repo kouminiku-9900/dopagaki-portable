@@ -64,9 +64,7 @@ PSPから次のサービスへ直接接続します。APIキーやアカウン�
 - `native/dopagaki/`：アプリ本体。`main.c`（画面・操作・再生の流れ）、`shorts.c`（YouTubeへの問い合わせ）、`shorts_parse.c`（応答の読み取り。Macでテスト）。
 - `native/common/komi_runtime.c`：Wi-Fi、通信、再生、画面の共通部分。縦持ち用に、動画はGE（PSPのグラフィックス）で90°回転・拡大縮小し、文字は回転した座標で直接描く処理を追加しています。
 - `native/app/`：komi-tube（新）のクライアント。漢字変換・マイリスト・文字描画はdopagakiからも使います。
-- 実機での自動試験：ビルド先（`vendor/tilefinch/build-preset-psp/dopagaki/`）に `dopagaki.cfg`（`autotest=1`）を置き、PSPLinkで `dopagaki.prx` を起動すると、おすすめ3本・検索・いいね・マイリストを自動で試して `dopagaki.txt` と縦向きのスクリーンショットを残します。詳しくは [docs/HANDOFF-DOPAGAKI.md](docs/HANDOFF-DOPAGAKI.md)。
-
-komi-tube由来のブラウザ版・ネイティブ版のビルド手順や経緯は [docs/HANDOFF.md](docs/HANDOFF.md)、[docs/HANDOFF-NATIVE.md](docs/HANDOFF-NATIVE.md) にそのまま残しています。
+- 実機での自動試験：ビルド先（`vendor/tilefinch/build-preset-psp/dopagaki/`）に `dopagaki.cfg`（`autotest=1`）を置き、PSPLinkで `dopagaki.prx` を起動すると、おすすめ3本・検索・いいね・マイリストを自動で試して `dopagaki.txt` と縦向きのスクリーンショットを残します。
 
 ## ありがとう
 

@@ -8,3 +8,7 @@ __pycache__/
 /field-logs/
 /tools
 /.venv
+
+# 内部向けのメモ（手元にだけ置く）
+/docs/
+/CLAUDE.md
